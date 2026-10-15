@@ -376,6 +376,8 @@ class PipetteDriver:
         mode         = gcmd.get_int("MODE",          1,                    minval=0, maxval=5)
         wait         = gcmd.get_int("WAIT",          1,                    minval=0, maxval=1)
         wait_timeout = gcmd.get_float("WAIT_TIMEOUT", self.action_timeout,   minval=0.1, maxval=300.0)
+        if self.device_type != "adp1000" or mode != 0:
+            self._require_tip_for_liquid_detection()
         try:
             if self.device_type == "adp1000":
                 self._backend.do_liquid_detect(mode=mode, wait=bool(wait), timeout_s=wait_timeout)
@@ -416,6 +418,17 @@ class PipetteDriver:
         """Return True if TIP is present. Called from pipette_action timer."""
         return self._backend.read_tip()
 
+    def _require_tip_for_liquid_detection(self):
+        self._check_ready()
+        try:
+            present = self.get_tip_present()
+        except Exception as e:
+            raise self.command_error(
+                "PipetteDriver: cannot verify TIP before liquid detection: %s" % e)
+        if not present:
+            raise self.command_error(
+                "PipetteDriver: TIP missing; install a TIP before liquid detection")
+
     def get_liquid_detected(self):
         """
         Return True if liquid is detected.
@@ -438,6 +451,7 @@ class PipetteDriver:
         mode: ADP1000 pressure-detect mode (0-5); SP20 ignores this.
         probe_timeout_s: used by SP20 as the Ld command timeout.
         """
+        self._require_tip_for_liquid_detection()
         if self.device_type == "adp1000":
             self._backend.start_liquid_probe(mode=mode)
         else:

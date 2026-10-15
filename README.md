@@ -79,14 +79,14 @@ chmod +x flash_rp2040_bootsel.sh
 ./deploy_to_klipper.sh
 ```
 
-The script first checks that the source and installed Klipper Git commits match,
-then backs up and copies the two core files needed for shared MCU pin/pressure
-stopping (`klippy/mcu.py` and `klippy/extras/trigger_analog.py`). It refuses an
-independently modified or different-version target for manual merging. It then
-links this directory's modules, including `load_cell_probe.py`, into
+The script checks that the installed Klipper matches the commit used by the
+bundled `klipper/klippy/mcu.py` and `klipper/klippy/extras/trigger_analog.py`,
+then backs up and copies those two files for shared MCU pin/pressure stopping.
+It refuses an independently modified or different-version target for manual
+merging. It then links this directory's modules, including `load_cell_probe.py`, into
 `~/klipper/klippy/extras/` and restarts Klipper. Existing regular targets get
-timestamped `.bak` copies. Run this script from the full project checkout;
-the separate `pipette` backup directory does not contain its Git source.
+timestamped `.bak` copies. The `pipette` directory is self-contained and can
+be deployed without the full project checkout.
 
 ### 3. Configure printer.cfg
 
