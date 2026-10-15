@@ -16,6 +16,7 @@ The active device is selected by `device_type` in `[pipette]` — no command cha
 | `PIPETTE_LIQUID_PROBE` | pipette_action | Z-axis liquid probe (Z moves down until liquid detected) |
 | `PIPETTE_READ_TIP_PIN` | pipette_action | Read physical `tip_pin` state (pin mode only) |
 | `PIPETTE_READ_LIQUID_PIN` | pipette_action | Read physical `liquid_pin` state (pin mode only) |
+| `PIPETTE_PRESSURE_TEST` | pipette_action | Record ADS1220 force at rest or during a bounded Z descent |
 
 ---
 
@@ -110,9 +111,12 @@ PIPETTE_PICKUP_TIP [INIT=0] [INIT_TIMEOUT=<s>]
 | `RETRACT` | `tip_retract_dist` | Retract distance after trigger (mm) |
 | `RETRACT_SPEED` | `retract_speed` | Retract speed (mm/s) |
 
-**Trigger source:**  
-- **With `tip_pin` configured:** hardware pin level change  
-- **Without `tip_pin`:** background timer polling `get_tip_present()` every `endstop_poll_interval`
+**Trigger source:** With `tip_pin` configured, only the MCU pin is used for
+the pre-check, Z stop, and post-trigger confirmation. Klipper does not poll
+device TIP status during the move. Without the pin, device polling stops Z instead.
+The RP2040 still reads device TIP status over RS485 to drive its output pin;
+the pin is not an independent sensor. Both automated descent commands require
+`min_safe_z`.
 
 ---
 
@@ -139,6 +143,53 @@ PIPETTE_LIQUID_PROBE [INIT=0] [INIT_TIMEOUT=<s>] [MODE=<0~5>]
 Before starting Z movement, liquid sensing is activated automatically  
 (`start_liquid_probe` → ADP1000 writes `REG_PRESSURE_DETECT`; SP20 sends `Ld1,<timeout_ms>`).  
 After Z movement completes, sensing is stopped automatically.
+With `liquid_pin` configured, only PC13 is used for the pre-check, Z stop,
+and post-trigger confirmation. Device liquid-status polling is used only when
+the pin is absent. USB communication is still required to start and stop liquid
+sensing. For SP20, `probe_timeout` must be at most 20 s and exceed
+`MAX_DIST / SPEED` by more than 2 s.
+
+### Optional ADS1220 pressure protection
+
+Both descent commands can use `[pipette_action]` settings
+`pressure_guard_force_g`, `pressure_guard_clear_time`, and optionally
+`pressure_guard_drift_g_s` (default 0). The guard is disabled when
+`pressure_guard_force_g` is absent. The force limit is the **extra** absolute
+force above a motion baseline, in grams, not the total ADC reading.
+
+`pressure_guard_clear_time` is a guaranteed contact-free period from the start
+of descent. The guard takes its baseline near the end of that period. A move
+too short to establish it is rejected before moving. A slow baseline drift may
+be compensated up to `pressure_guard_drift_g_s` only while readings remain far
+below the threshold. A sustained extra force stops Z and raises a protection
+error; it does not run `EXTRA_TRAVEL` or report normal pipette success. A pipette
+pipette detection takes priority if both arrive together. ADS1220 measurements are
+batched, so protection has more stopping delay than an MCU pin. Determine the
+clear period, drift limit, force limit, and stopping distance from traces before
+enabling the guard.
+
+### PIPETTE_PRESSURE_TEST
+
+Record a stationary trace or a bounded descent without installing a pressure
+threshold. The selected pipette sensor remains the descent endstop. A normal
+no-contact test may reach `DIST` without triggering. The command never performs
+extra downward travel or retracts automatically.
+
+```
+PIPETTE_PRESSURE_TEST DIST=0 HOLD=1
+PIPETTE_PRESSURE_TEST DIST=20 SPEED=5 SOURCE=TIP
+PIPETTE_PRESSURE_TEST DIST=20 SPEED=5 SOURCE=LIQUID
+```
+
+`DIST` is 0–100 mm; a moving test may last at most 30 s. `HOLD` (0.2–10 s)
+applies only when `DIST=0`. Z must be homed and `min_safe_z` must be configured
+for a moving test. The command checks that limit and refuses an already triggered selected
+sensor. Its console summary reports the baseline, moving sample count, force
+range, sampling errors, and stop reason. A CSV is written beside `klippy.log`
+with sample time, raw counts, grams, and an **estimated** Z position. That Z
+estimate uses commanded speed and is approximate during acceleration and
+stopping. If a short move has no moving ADS1220 samples, the summary says so;
+no motion baseline can be inferred from that trace.
 
 ---
 

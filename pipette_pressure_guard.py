@@ -1,0 +1,203 @@
+"""Optional ADS1220 force backup for pipette Z probing moves."""
+
+from collections import deque
+import math
+from statistics import median
+import time
+
+
+class MovingPressureGuard:
+    """Learn motion preload in a known clear interval, then watch extra force."""
+
+    def __init__(self, load_cell, limit_g, settle_time, drift_g_per_s,
+                 clock=None):
+        self._load_cell = load_cell
+        self._limit_g = limit_g
+        self._settle_time = settle_time
+        self._drift_g_per_s = drift_g_per_s
+        self._on_stop = None
+        self._clock = clock or time.monotonic
+        self._active = False
+        self._start_time = None
+        self._baseline = None
+        self._baseline_samples = deque()
+        self._window = deque()
+        self._above_since = None
+        self._last_time = None
+        self._last_batch_time = None
+        self.reason = None
+        self.trip_time = None
+
+    def start(self, print_time):
+        self._start_time = print_time
+        self._active = True
+        self._last_batch_time = self._clock()
+        self._load_cell.add_client(self._on_batch)
+
+    def set_on_stop(self, callback):
+        self._on_stop = callback
+
+    def stop(self):
+        self._active = False
+
+    def check_stale(self, eventtime, current_print_time=None):
+        if (current_print_time is not None
+                and current_print_time < self._start_time + 0.35):
+            return
+        if self._active and eventtime - self._last_batch_time > 0.35:
+            self._abort("ADS1220 samples stopped during descent")
+
+    def _abort(self, reason, print_time=None):
+        if self.reason is None:
+            self.reason = reason
+            self.trip_time = print_time
+            self._on_stop()
+
+    def _on_batch(self, msg):
+        if not self._active:
+            return False
+        if msg.get('errors') or msg.get('overflows'):
+            self._abort("ADS1220 reported sampling errors during descent")
+            return True
+        if any(row[0] >= self._start_time for row in msg.get('data', ())):
+            self._last_batch_time = self._clock()
+        range_min, range_max = self._load_cell.get_sensor().get_range()
+        for print_time, force_g, _counts, _tare in msg.get('data', ()):
+            if self.reason is not None:
+                break
+            if print_time < self._start_time:
+                continue
+            if force_g is None or not math.isfinite(force_g):
+                self._abort("ADS1220 load cell force is unavailable or invalid",
+                            print_time)
+                break
+            if _counts <= range_min or _counts >= range_max:
+                self._abort("ADS1220 reading saturated during descent",
+                            print_time)
+                break
+            if self._baseline is None:
+                self._baseline_samples.append((print_time, force_g))
+                # Use the end of the clear interval, after startup acceleration.
+                cutoff = print_time - min(0.1, self._settle_time / 2.)
+                while (self._baseline_samples
+                       and self._baseline_samples[0][0] < cutoff):
+                    self._baseline_samples.popleft()
+                if print_time < self._start_time + self._settle_time:
+                    continue
+                if len(self._baseline_samples) < 5:
+                    self._abort("insufficient ADS1220 samples for motion baseline",
+                                print_time)
+                    break
+                self._baseline = median(v for _, v in self._baseline_samples)
+                self._last_time = print_time
+                self._baseline_samples.clear()
+                continue
+            self._window.append((print_time, force_g))
+            cutoff = print_time - 0.025
+            while self._window and self._window[0][0] < cutoff:
+                self._window.popleft()
+            if len(self._window) < 5:
+                continue
+            filtered = median(v for _, v in self._window)
+            delta = abs(filtered - self._baseline)
+            if delta >= self._limit_g:
+                if self._above_since is None:
+                    self._above_since = print_time
+                elif print_time - self._above_since >= 0.025:
+                    self._abort("ADS1220 pressure protection: extra force "
+                                "%.3f g >= %.3f g" % (delta, self._limit_g),
+                                print_time)
+                    break
+            else:
+                self._above_since = None
+                # Follow slow preload drift only while far from contact.
+                if delta < self._limit_g / 2.:
+                    elapsed = max(0., print_time - self._last_time)
+                    step = self._drift_g_per_s * elapsed
+                    self._baseline += max(-step, min(step,
+                                                       filtered - self._baseline))
+            self._last_time = print_time
+        return True
+
+
+class GuardedEndstop:
+    """Stop a probing move when either its original endstop or force trips."""
+
+    def __init__(self, printer, endstop, guard):
+        self._printer = printer
+        self._reactor = printer.get_reactor()
+        self._endstop = endstop
+        self._guard = guard
+        self._completion = None
+        self._watchdog_timer = None
+        guard.set_on_stop(self._pressure_stop)
+
+    def _pressure_stop(self):
+        self._completion.complete(1)
+
+    def _check_sensor(self, eventtime):
+        print_time = self.get_mcu().estimated_print_time(eventtime)
+        self._guard.check_stale(eventtime, print_time)
+        if self._guard.reason is not None:
+            return self._reactor.NEVER
+        return eventtime + 0.1
+
+    def _relay_original(self, completion):
+        # Klipper completes a successful MCU trsync with False. Completion,
+        # not its boolean result, is what must stop the host's drip move.
+        completion.wait()
+        self._completion.complete(1)
+
+    def get_mcu(self):
+        return self._endstop.get_mcu()
+
+    def get_steppers(self):
+        return self._endstop.get_steppers()
+
+    def home_start(self, print_time, sample_time, sample_count,
+                   rest_time, triggered=True):
+        original = self._endstop.home_start(
+            print_time, sample_time, sample_count, rest_time, triggered)
+        self._completion = self._reactor.completion()
+        self._guard.start(print_time)
+        self._watchdog_timer = self._reactor.register_timer(
+            self._check_sensor, self._reactor.monotonic() + 0.1)
+        self._reactor.register_callback(
+            lambda eventtime: self._relay_original(original))
+        return self._completion
+
+    def home_wait(self, home_end_time):
+        try:
+            trigger_time = self._endstop.home_wait(home_end_time)
+        finally:
+            if self._watchdog_timer is not None:
+                self._reactor.unregister_timer(self._watchdog_timer)
+                self._watchdog_timer = None
+            self._guard.stop()
+        # Compare measurement times, not message arrival order. The physical
+        # pin wins a tie; a later pin must not mask an earlier pressure trip.
+        pin_time = (self._endstop.trigger_time_to_print_time(trigger_time)
+                    if trigger_time > 0. else None)
+        if (pin_time is not None and
+                (self._guard.reason is None or
+                 (self._guard.trip_time is not None
+                  and pin_time <= self._guard.trip_time))):
+            return trigger_time
+        if self._guard.reason is not None:
+            raise self._printer.command_error(self._guard.reason)
+        if self._guard._baseline is None:
+            raise self._printer.command_error(
+                "ADS1220 motion baseline was not established")
+        return trigger_time
+
+    def probe_prepare(self, hmove):
+        return self._endstop.probe_prepare(hmove)
+
+    def probe_finish(self, hmove):
+        return self._endstop.probe_finish(hmove)
+
+    def multi_probe_begin(self):
+        return self._endstop.multi_probe_begin()
+
+    def multi_probe_end(self):
+        return self._endstop.multi_probe_end()

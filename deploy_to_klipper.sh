@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # deploy_to_klipper.sh
-# 将 klipper_pipette/ 下的驱动文件以软链接方式部署到 ~/klipper/klippy/extras/
+# 将本目录下的驱动文件以软链接方式部署到 ~/klipper/klippy/extras/
 # 同时为 pipette_driver.py 创建 pipette.py 别名（Klipper section 名匹配要求）
 #
 # 用法：
@@ -17,6 +17,9 @@ EXTRAS_DIR="${1:-${HOME}/klipper/klippy/extras}"
 declare -A LINKS=(
     ["pipette_driver.py"]="pipette_driver.py"
     ["pipette_action.py"]="pipette_action.py"
+    ["pipette_pressure_guard.py"]="pipette_pressure_guard.py"
+    ["pipette_pressure_trace.py"]="pipette_pressure_trace.py"
+    ["load_cell_probe.py"]="load_cell_probe.py"
     ["adp1000_backend.py"]="adp1000_backend.py"
     ["sp20_backend.py"]="sp20_backend.py"
 )

@@ -282,11 +282,19 @@ class Sp20Backend:
     def read_tip(self):
         """Return True if TIP is present (register 3 == '1')."""
         state, data = self._transceive("Rr3")
+        if state is None or state >= 10 or data not in ("0", "1"):
+            raise RuntimeError(
+                "Sp20Backend: invalid TIP status state=%s data=%r"
+                % (state, data))
         return data == "1"
 
     def read_liquid_detected(self):
         """Return True if liquid is detected (register 2 == '1')."""
         state, data = self._transceive("Rr2")
+        if state is None or state >= 10 or data not in ("0", "1"):
+            raise RuntimeError(
+                "Sp20Backend: invalid liquid status state=%s data=%r"
+                % (state, data))
         return data == "1"
 
     def read_volume_status(self):

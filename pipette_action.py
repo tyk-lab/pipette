@@ -20,6 +20,7 @@ Target path: ~/klipper/klippy/extras/pipette_action.py
 """
 
 import logging
+from . import pipette_pressure_guard, pipette_pressure_trace
 
 # ---- Polling constants ----
 _ENDSTOP_POLL_S          = 0.1
@@ -93,6 +94,9 @@ class _PipetteSoftEndstop:
         if self._abort_reason is not None:
             raise self._printer.command_error(self._abort_reason)
         return self._trigger_time
+
+    def trigger_time_to_print_time(self, trigger_time):
+        return self.get_mcu().estimated_print_time(trigger_time)
 
     def probe_prepare(self, hmove):
         if self._prepare_fn is not None:
@@ -173,6 +177,9 @@ class _PinEndstopWithCallbacks:
     def home_wait(self, home_end_time):
         return self._mcu_endstop.home_wait(home_end_time)
 
+    def trigger_time_to_print_time(self, trigger_time):
+        return trigger_time
+
     def probe_prepare(self, hmove):
         if self._prepare_fn is not None:
             self._prepare_fn()
@@ -195,14 +202,14 @@ class _PinEndstopWithCallbacks:
 class PipetteAction:
 
     cmd_pipette_pickup_tip_help = (
-        "TIP pickup: move Z downward while polling get_tip_present(); "
+        "TIP pickup: move Z downward until the selected endstop triggers; "
         "stop when TIP is detected, push down EXTRA_TRAVEL mm, then retract. "
         "Params: INIT=0/1 INIT_TIMEOUT=s MAX_DIST=mm SPEED=mm/s "
         "EXTRA_TRAVEL=mm RETRACT=mm RETRACT_SPEED=mm/s"
     )
     cmd_pipette_liquid_probe_help = (
-        "Liquid probe: activate liquid sensing, move Z downward while polling "
-        "get_liquid_detected(); stop, apply EXTRA_TRAVEL, then retract. "
+        "Liquid probe: activate sensing, move Z until the selected endstop "
+        "triggers; stop, apply EXTRA_TRAVEL, then retract. "
         "Params: INIT=0/1 INIT_TIMEOUT=s MODE=0~5 MAX_DIST=mm "
         "SPEED=mm/s EXTRA_TRAVEL=mm RETRACT=mm RETRACT_SPEED=mm/s"
     )
@@ -210,6 +217,9 @@ class PipetteAction:
         "Read tip_pin endstop state (pin mode only). 1=triggered, 0=open.")
     cmd_pipette_read_liquid_pin_help = (
         "Read liquid_pin current physical level and endstop state.")
+    cmd_pipette_pressure_test_help = (
+        "Record ADS1220 force during a stationary hold or bounded Z descent. "
+        "DIST=0..100 SPEED=mm/s SOURCE=tip|liquid HOLD=s")
 
     def __init__(self, config):
         self.printer       = config.get_printer()
@@ -232,13 +242,23 @@ class PipetteAction:
         # ---- Timeout and liquid-probe parameters ----
         self.init_timeout        = config.getfloat("init_timeout",        60.0, minval=1.0,  maxval=300.0)
         self.liquid_detect_mode  = config.getint("liquid_detect_mode",    1,    minval=0,    maxval=5)
-        self.probe_timeout       = config.getfloat("probe_timeout",       30.0, minval=5.0,  maxval=300.0)
+        self.probe_timeout       = config.getfloat("probe_timeout",       15.0, minval=5.0,  maxval=300.0)
 
         # ---- Safety parameters ----
         self.min_safe_z          = config.getfloat("min_safe_z",          None)
         self.max_comm_failures   = config.getint("max_comm_failures",     3,    minval=1,   maxval=10)
         self.endstop_poll_interval = config.getfloat(
             "endstop_poll_interval", _ENDSTOP_POLL_S, minval=0.02, maxval=5.0)
+        self.pressure_guard_force_g = config.getfloat(
+            "pressure_guard_force_g", None, minval=0.05)
+        self.pressure_guard_clear_time = config.getfloat(
+            "pressure_guard_clear_time", None, minval=0.15, maxval=5.0)
+        self.pressure_guard_drift_g_s = config.getfloat(
+            "pressure_guard_drift_g_s", 0.0, minval=0.0)
+        if (self.pressure_guard_force_g is not None
+                and self.pressure_guard_clear_time is None):
+            raise config.error(
+                "pressure_guard_clear_time is required when pressure guard is enabled")
 
         # ---- Optional physical pins ----
         self._tip_pin_name       = config.get("tip_pin",    None)
@@ -301,7 +321,8 @@ class PipetteAction:
         # ---- TIP endstop ----
         if self._tip_mcu_endstop is not None:
             self._tip_endstop = _PinEndstopWithCallbacks(self._tip_mcu_endstop)
-            logging.info("PipetteAction: TIP endstop -> pin mode (%s)", self._tip_pin_name)
+            logging.info("PipetteAction: TIP endstop -> pin mode (%s)",
+                         self._tip_pin_name)
         else:
             self._tip_endstop = _PipetteSoftEndstop(
                 self.printer,
@@ -319,7 +340,8 @@ class PipetteAction:
                 finish_fn=self._liquid_probe_stop,
                 triggered_value=self._low_level_raw_endstop_state(),
             )
-            logging.info("PipetteAction: liquid endstop -> pin mode (%s)", self._liquid_pin_name)
+            logging.info("PipetteAction: liquid endstop -> pin mode (%s)",
+                         self._liquid_pin_name)
         else:
             self._liquid_endstop = _PipetteSoftEndstop(
                 self.printer,
@@ -355,6 +377,9 @@ class PipetteAction:
             desc=self.cmd_pipette_read_tip_pin_help)
         reg("PIPETTE_READ_LIQUID_PIN",  self.cmd_pipette_read_liquid_pin,
             desc=self.cmd_pipette_read_liquid_pin_help)
+        self._pressure_test = pipette_pressure_trace.PipettePressureTest(self)
+        reg("PIPETTE_PRESSURE_TEST", self._pressure_test.cmd,
+            desc=self.cmd_pipette_pressure_test_help)
 
     # ================================================================
     #  Internal helpers
@@ -364,6 +389,17 @@ class PipetteAction:
         if self._drv is None:
             raise self.command_error(
                 "PipetteAction: '%s' not ready yet" % self._pipette_name)
+
+    def _get_pressure_load_cell(self):
+        probe = self.printer.lookup_object("probe", None)
+        if probe is None or not hasattr(probe, "get_load_cell"):
+            raise self.command_error(
+                "PipetteAction: [load_cell_probe] is required for pressure sensing")
+        load_cell = probe.get_load_cell()
+        if not load_cell.is_calibrated() or not load_cell.is_tared():
+            raise self.command_error(
+                "PipetteAction: calibrate and tare the ADS1220 load cell first")
+        return load_cell
 
     def _query_pin_state(self, mcu_endstop, pin_name, wait=True):
         if mcu_endstop is None:
@@ -427,13 +463,19 @@ class PipetteAction:
         except self.command_error:
             raise
         except Exception as e:
+            # A command can reach the device even if its reply is lost.
+            try:
+                self._drv.stop_liquid_probe()
+            except Exception as stop_error:
+                logging.warning("PipetteAction: failed to clean up liquid start: %s",
+                                stop_error)
             raise self.command_error(
                 self._format_driver_error("PIPETTE_LIQUID_PROBE", e))
         self._liq_probe_active = True
         logging.info("PipetteAction: liquid probe started mode=%d", self._current_liq_mode)
 
     def _liquid_probe_stop(self):
-        """Stop liquid sensing after Z movement. Idempotent and failure-safe."""
+        """Stop liquid sensing after Z movement; report cleanup failures."""
         if not self._liq_probe_active:
             return
         self._liq_probe_active = False
@@ -441,7 +483,70 @@ class PipetteAction:
             self._drv.stop_liquid_probe()
             logging.info("PipetteAction: liquid probe stopped")
         except Exception as e:
-            logging.warning("PipetteAction: failed to stop liquid probe: %s", e)
+            raise self.command_error(
+                self._format_driver_error("PIPETTE_LIQUID_PROBE stop", e))
+
+    def _check_tip_before_move(self):
+        try:
+            if self._tip_mcu_endstop is not None:
+                present = self._query_pin_state(
+                    self._tip_mcu_endstop, "tip_pin", wait=False)
+            else:
+                present = self._drv.get_tip_present()
+        except Exception as e:
+            raise self.command_error(
+                self._format_driver_error("PIPETTE_PICKUP_TIP pre-check", e))
+        if present:
+            raise self.command_error(
+                "PIPETTE_PICKUP_TIP: selected TIP sensor is already triggered")
+
+    def _confirm_tip_trigger(self):
+        if self._tip_mcu_endstop is None:
+            return
+        try:
+            pin_present = self._query_pin_state(
+                self._tip_mcu_endstop, "tip_pin", wait=False)
+        except Exception as e:
+            raise self.command_error(
+                self._format_driver_error("PIPETTE_PICKUP_TIP confirmation", e))
+        if not pin_present:
+            raise self.command_error(
+                "PIPETTE_PICKUP_TIP: tip_pin is no longer triggered; "
+                "extra travel cancelled")
+
+    def _validate_liquid_move(self, distance, speed):
+        if self._drv.device_type != "sp20":
+            return
+        minimum_timeout = distance / speed + 2.0
+        if self.probe_timeout > 20.0 or self.probe_timeout <= minimum_timeout:
+            raise self.command_error(
+                "PIPETTE_LIQUID_PROBE: SP20 probe_timeout must be <=20 s and "
+                "> %.1f s for this descent" % minimum_timeout)
+
+    def _check_liquid_before_move(self):
+        try:
+            detected = (self.get_liquid_pin_detected(wait=False)[0]
+                        if self._liquid_mcu_endstop is not None
+                        else self._drv.get_liquid_detected())
+        except Exception as e:
+            raise self.command_error(
+                self._format_driver_error("PIPETTE_LIQUID_PROBE pre-check", e))
+        if detected:
+            raise self.command_error(
+                "PIPETTE_LIQUID_PROBE: liquid already detected after sensing start")
+
+    def _confirm_liquid_trigger(self):
+        if self._liquid_mcu_endstop is None:
+            return
+        try:
+            detected = self.get_liquid_pin_detected(wait=False)[0]
+        except Exception as e:
+            raise self.command_error(
+                self._format_driver_error("PIPETTE_LIQUID_PROBE confirmation", e))
+        if not detected:
+            raise self.command_error(
+                "PIPETTE_LIQUID_PROBE: liquid_pin is no longer triggered; "
+                "check PC13 wiring or signal hold time")
 
     def _do_init(self, timeout_s):
         try:
@@ -484,7 +589,7 @@ class PipetteAction:
                 % (label, target_z, max_z))
 
     def _z_probe_via_homing(self, gcmd, toolhead, params, endstop, label,
-                            extra_travel=0.0):
+                            extra_travel=0.0, confirm_fn=None):
         max_dist      = params["max_dist"]
         probe_speed   = params["probe_speed"]
         retract_dist  = params["retract_dist"]
@@ -495,7 +600,10 @@ class PipetteAction:
         start_z = pos[2]
 
         target_z = start_z - max_dist
-        if self.min_safe_z is not None and target_z < self.min_safe_z:
+        if self.min_safe_z is None:
+            raise self.command_error(
+                "%s: set min_safe_z before an automatic Z descent" % label)
+        if target_z < self.min_safe_z:
             raise self.command_error(
                 "%s: target Z=%.3f mm exceeds safety limit %.3f mm"
                 % (label, target_z, self.min_safe_z))
@@ -506,8 +614,23 @@ class PipetteAction:
 
         pos[2] = target_z
         phoming = self.printer.lookup_object("homing")
+        if self.pressure_guard_force_g is not None:
+            clear_time = self.pressure_guard_clear_time
+            if max_dist / probe_speed <= clear_time + 0.1:
+                raise self.command_error(
+                    "%s: descent is too short to establish the pressure baseline"
+                    % label)
+            load_cell = self._get_pressure_load_cell()
+            guard = pipette_pressure_guard.MovingPressureGuard(
+                load_cell, self.pressure_guard_force_g, clear_time,
+                self.pressure_guard_drift_g_s, self.reactor.monotonic)
+            endstop = pipette_pressure_guard.GuardedEndstop(
+                self.printer, endstop, guard)
         epos = phoming.probing_move(endstop, pos, probe_speed)
         trigger_z = epos[2]
+
+        if confirm_fn is not None:
+            confirm_fn()
 
         gcmd.respond_info(
             "%s: triggered at Z=%.3f mm (moved %.3f mm)"
@@ -563,23 +686,14 @@ class PipetteAction:
         else:
             gcmd.respond_info("PIPETTE_PICKUP_TIP: [1/2] skipping init (INIT=0)")
 
-        # Pre-check: abort early if TIP already present
-        try:
-            if self._drv.get_tip_present():
-                raise self.command_error(
-                    "PIPETTE_PICKUP_TIP: TIP is already present; "
-                    "eject first or check the sensor")
-            gcmd.respond_info("PIPETTE_PICKUP_TIP: pre-check TIP absent OK")
-        except self.command_error:
-            raise
-        except Exception as e:
-            gcmd.respond_info(
-                "PIPETTE_PICKUP_TIP: WARNING could not pre-check TIP: %s" % e)
+        self._check_tip_before_move()
+        gcmd.respond_info("PIPETTE_PICKUP_TIP: pre-check TIP absent OK")
 
         gcmd.respond_info("PIPETTE_PICKUP_TIP: [2/2] starting Z move for TIP detection...")
         trigger_z = self._z_probe_via_homing(
             gcmd, toolhead, params, self._tip_endstop,
-            "PIPETTE_PICKUP_TIP", extra_travel=extra_travel)
+            "PIPETTE_PICKUP_TIP", extra_travel=extra_travel,
+            confirm_fn=self._confirm_tip_trigger)
         gcmd.respond_info(
             "PIPETTE_PICKUP_TIP: success  trigger Z=%.3f mm" % trigger_z)
 
@@ -605,25 +719,32 @@ class PipetteAction:
         else:
             gcmd.respond_info("PIPETTE_LIQUID_PROBE: [1/2] skipping init (INIT=0)")
 
-        # Pre-check: abort early if liquid already detected
-        try:
-            if self._drv.get_liquid_detected():
-                raise self.command_error(
-                    "PIPETTE_LIQUID_PROBE: liquid already detected; "
-                    "reset device before probing again")
-            gcmd.respond_info("PIPETTE_LIQUID_PROBE: pre-check no liquid OK")
-        except self.command_error:
-            raise
-        except Exception as e:
-            gcmd.respond_info(
-                "PIPETTE_LIQUID_PROBE: WARNING could not pre-check liquid: %s" % e)
-
+        self._validate_liquid_move(params["max_dist"], params["probe_speed"])
+        toolhead.wait_moves()
+        if (self.min_safe_z is None or
+                toolhead.get_position()[2] - params["max_dist"] < self.min_safe_z):
+            raise self.command_error(
+                "PIPETTE_LIQUID_PROBE: set a min_safe_z below the target Z")
         self._current_liq_mode = liq_mode
         gcmd.respond_info(
             "PIPETTE_LIQUID_PROBE: [2/2] starting Z move for liquid detection MODE=%d..." % liq_mode)
-        trigger_z = self._z_probe_via_homing(
-            gcmd, toolhead, params, self._liquid_endstop,
-            "PIPETTE_LIQUID_PROBE", extra_travel=extra_travel)
+        try:
+            self._liquid_probe_start()
+            self._check_liquid_before_move()
+            gcmd.respond_info("PIPETTE_LIQUID_PROBE: pre-check no liquid OK")
+            trigger_z = self._z_probe_via_homing(
+                gcmd, toolhead, params, self._liquid_endstop,
+                "PIPETTE_LIQUID_PROBE", extra_travel=extra_travel,
+                confirm_fn=self._confirm_liquid_trigger)
+        except Exception:
+            try:
+                self._liquid_probe_stop()
+            except Exception as stop_error:
+                logging.error("PipetteAction: liquid cleanup also failed: %s",
+                              stop_error)
+            raise
+        else:
+            self._liquid_probe_stop()
         gcmd.respond_info(
             "PIPETTE_LIQUID_PROBE: success  trigger Z=%.3f mm" % trigger_z)
 
@@ -643,7 +764,6 @@ class PipetteAction:
             % (self._liquid_pin_name, level, 1 if detected else 0,
                "TRIGGERED" if detected else "OPEN",
                1 if raw_state else 0, "TRIGGERED" if raw_state else "OPEN"))
-
 
 def load_config(config):
     return PipetteAction(config)

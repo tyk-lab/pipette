@@ -14,7 +14,7 @@ Klipper (Linux host)
     │       ├── adp1000_backend.py  (loaded when device_type: adp1000)
     │       └── sp20_backend.py     (loaded when device_type: sp20)
     │
-    └── pipette_action.py   ← [pipette_action] section — Z-axis movement, 2+2 G-code commands
+    └── pipette_action.py   ← [pipette_action] section — Z-axis movement and pressure test
             (calls pipette_driver public API; device-agnostic)
                 │
                 │  USB CDC (115200 baud — constant)
@@ -38,6 +38,9 @@ Klipper always communicates with the RP2040 at 115200 baud over USB CDC.
 | `adp1000_backend.py` | ADP1000 Modbus RTU protocol (FC03/FC06, CRC16, register map) |
 | `sp20_backend.py` | SP20 KT_OEM binary frame protocol (frame builder/parser, state machine) |
 | `pipette_action.py` | Z-axis TIP pickup and liquid probe with software/hardware endstop |
+| `pipette_pressure_guard.py` | Optional ADS1220 extra-force stop during Z descent |
+| `pipette_pressure_trace.py` | Bounded ADS1220 trace and CSV export |
+| `load_cell_probe.py` | Klipper load-cell module with `get_load_cell()` for pipette pressure sensing |
 | `pipette.cfg` | Example configuration — include in `printer.cfg` |
 | `flash_rp2040_bootsel.sh` | Helper script to flash RP2040 firmware via BOOTSEL |
 
@@ -70,16 +73,15 @@ chmod +x flash_rp2040_bootsel.sh
 ./flash_rp2040_bootsel.sh
 ```
 
-### 2. Copy extras to Klipper
+### 2. Deploy extras to Klipper
 
 ```bash
-cp pipette_driver.py    ~/klipper/klippy/extras/
-cp adp1000_backend.py   ~/klipper/klippy/extras/
-cp sp20_backend.py      ~/klipper/klippy/extras/
-cp pipette_action.py    ~/klipper/klippy/extras/
+./deploy_to_klipper.sh
 ```
 
-All four files must be in the **same directory**.
+The script links this directory's modules, including `load_cell_probe.py`, into
+`~/klipper/klippy/extras/` and restarts Klipper. If a target is a regular file,
+the script saves it with a timestamped `.bak` suffix before creating the link.
 
 ### 3. Configure printer.cfg
 
@@ -183,6 +185,18 @@ See [GCODE_COMMANDS.md](GCODE_COMMANDS.md) for the full command reference.
 | `retract_speed` | 10.0 mm/s | Retract speed |
 | `init_timeout` | 30.0 s | Init timeout when `INIT=1` used |
 | `liquid_detect_mode` | 1 | ADP1000 pressure mode (SP20 ignores) |
-| `probe_timeout` | 30.0 s | Total timeout for Z probing movement |
+| `probe_timeout` | 15.0 s | Device liquid-detection timeout; SP20 supports at most 20 s |
+| `min_safe_z` | *(required for automatic descent)* | Lowest Z allowed at both stations |
 | `tip_pin` | *(none)* | Hardware endstop pin for TIP detection |
 | `liquid_pin` | *(none)* | Hardware endstop pin for liquid detection |
+| `pressure_guard_force_g` | *(none)* | Extra-force limit in g; absent disables the guard |
+| `pressure_guard_clear_time` | *(none)* | Required contact-free baseline period when guard is enabled |
+| `pressure_guard_drift_g_s` | 0 | Maximum slow motion-baseline drift compensation |
+
+When a trigger pin is configured, that pin alone decides whether to stop the
+corresponding Z descent. Without a pin, device-status polling is used instead.
+SP20 liquid sensing still needs USB commands to start and stop detection.
+
+Use `PIPETTE_PRESSURE_TEST` to measure motion preload before configuring the
+guard. Moving tests and automatic descents require a configured `min_safe_z`. See
+[GCODE_COMMANDS.md](GCODE_COMMANDS.md) for the command and safety details.
