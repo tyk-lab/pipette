@@ -3,6 +3,7 @@ import sys
 import unittest
 from unittest.mock import Mock, patch
 
+from pipette.pipette_driver import PipetteDriver
 from pipette.sp20_backend import Sp20Backend
 
 
@@ -22,6 +23,58 @@ class Sp20StatusTests(unittest.TestCase):
         backend._transceive = lambda command: (2, '1')
         self.assertTrue(backend.read_tip())
         self.assertTrue(backend.read_liquid_detected())
+
+
+class LiquidTipRequirementTests(unittest.TestCase):
+    def setUp(self):
+        self.driver = object.__new__(PipetteDriver)
+        self.driver.command_error = RuntimeError
+        self.driver._backend = Mock()
+        self.driver.device_type = 'sp20'
+        self.driver.action_timeout = 20.
+        self.gcmd = Mock()
+        self.gcmd.get_int.side_effect = lambda name, default, **kwargs: default
+        self.gcmd.get_float.side_effect = lambda name, default, **kwargs: default
+
+    def test_missing_tip_rejects_both_liquid_start_paths(self):
+        self.driver._backend.read_tip.return_value = False
+        for device_type in ('sp20', 'adp1000'):
+            with self.subTest(device_type=device_type):
+                self.driver.device_type = device_type
+                with self.assertRaisesRegex(RuntimeError, 'TIP missing'):
+                    self.driver.start_liquid_probe(mode=1, probe_timeout_s=15.)
+                with self.assertRaisesRegex(RuntimeError, 'TIP missing'):
+                    self.driver.cmd_pipette_start_liquid_detect(self.gcmd)
+                with self.assertRaisesRegex(RuntimeError, 'TIP missing'):
+                    self.driver.cmd_pipette_liquid_detect(self.gcmd)
+                self.driver._backend.start_liquid_probe.assert_not_called()
+                self.driver._backend.do_liquid_detect.assert_not_called()
+
+    def test_tip_read_failure_rejects_liquid_start(self):
+        self.driver._backend.read_tip.side_effect = RuntimeError('RS485 timeout')
+        with self.assertRaisesRegex(RuntimeError, 'cannot verify TIP.*RS485 timeout'):
+            self.driver.start_liquid_probe(mode=1, probe_timeout_s=15.)
+        self.driver._backend.start_liquid_probe.assert_not_called()
+
+    def test_present_tip_allows_liquid_detection_for_both_devices(self):
+        self.driver._backend.read_tip.return_value = True
+        for device_type in ('sp20', 'adp1000'):
+            with self.subTest(device_type=device_type):
+                self.driver.device_type = device_type
+                self.driver.start_liquid_probe(mode=1, probe_timeout_s=15.)
+                self.driver.cmd_pipette_liquid_detect(self.gcmd)
+        self.assertEqual(self.driver._backend.read_tip.call_count, 4)
+        self.assertEqual(self.driver._backend.start_liquid_probe.call_count, 2)
+        self.assertEqual(self.driver._backend.do_liquid_detect.call_count, 2)
+
+    def test_adp1000_mode_zero_can_turn_detection_off_without_tip(self):
+        self.driver.device_type = 'adp1000'
+        self.driver._backend.read_tip.return_value = False
+        self.gcmd.get_int.side_effect = (
+            lambda name, default, **kwargs: 0 if name == 'MODE' else default)
+        self.driver.cmd_pipette_liquid_detect(self.gcmd)
+        self.driver._backend.read_tip.assert_not_called()
+        self.driver._backend.do_liquid_detect.assert_called_once()
 
 
 def load_action_module():
@@ -241,7 +294,7 @@ class PressureSourceTests(unittest.TestCase):
         with (patch.object(module.pipette_pressure_guard, 'MovingPressureGuard') as guard,
               patch.object(module.pipette_pressure_guard, 'GuardedEndstop') as wrapped,
               patch.object(module.pipette_pressure_trace, 'PressureTrace') as trace):
-            trace.log_directory.return_value = 'unused-test-directory'
+            trace.report_directory.return_value = 'unused-test-directory'
             for source, force, clear, extra in (
                     ('tip', 250., 0.2, 3.), ('liquid', 5., 0.3, 0.)):
                 with self.subTest(source=source):

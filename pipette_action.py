@@ -626,7 +626,7 @@ class PipetteAction:
                     "%s: descent is too short to establish the pressure baseline"
                     % label)
             load_cell = self._get_pressure_load_cell()
-            directory = pipette_pressure_trace.PressureTrace.log_directory(
+            directory = pipette_pressure_trace.PressureTrace.report_directory(
                 self.printer)
             trace = pipette_pressure_trace.PressureTrace(load_cell)
             guard = pipette_pressure_guard.MovingPressureGuard(
@@ -637,13 +637,13 @@ class PipetteAction:
             trace.start()
         try:
             epos = phoming.probing_move(endstop, pos, probe_speed)
-        except Exception:
+        except Exception as move_error:
             if trace is not None:
                 trace.stop()
-                if guard.reason is not None:
-                    pipette_pressure_trace.report_guard_failure(
-                        trace, directory, gcmd, toolhead, start_z,
-                        probe_speed, guard)
+                pipette_pressure_trace.report_guard_failure(
+                    trace, directory, gcmd, toolhead, start_z,
+                    probe_speed, guard, self, pressure_source,
+                    params, extra_travel, move_error)
             raise
         else:
             if trace is not None:

@@ -1,4 +1,5 @@
 import csv
+import os
 import tempfile
 import unittest
 
@@ -204,6 +205,19 @@ class PressureTraceTests(unittest.TestCase):
         class Guard:
             reason = 'ADS1220 pressure protection: extra force 8 g >= 5 g'
             _start_time = 1.0
+            _limit_g = 5.
+            _settle_time = 0.15
+            _drift_g_per_s = 0.
+            _baseline = 0.
+            trip_time = 1.2
+
+        class Action:
+            _tip_mcu_endstop = object()
+            _tip_pin_name = '^th:PB9'
+            min_safe_z = 0.
+
+            class _drv:
+                device_type = 'sp20'
 
         class Gcmd:
             def __init__(self):
@@ -212,18 +226,33 @@ class PressureTraceTests(unittest.TestCase):
             def respond_info(self, message):
                 self.messages.append(message)
 
+            def get_commandline(self):
+                return 'PIPETTE_PICKUP_TIP MAX_DIST=5 SPEED=1 EXTRA_TRAVEL=0 RETRACT=0'
+
         with tempfile.TemporaryDirectory() as directory:
             gcmd = Gcmd()
             report_guard_failure(trace, directory, gcmd, Toolhead(),
-                                 20., 5., Guard())
+                                 20., 1., Guard(), Action(), 'tip',
+                                 {'max_dist': 5., 'retract_dist': 0.,
+                                  'retract_speed': 10.}, 0.)
             self.assertIn('stop_reason=ADS1220 pressure protection',
                           gcmd.messages[0])
             path = gcmd.messages[0].split('CSV=')[1]
             with open(path, newline='', encoding='utf-8') as source:
                 rows = list(csv.DictReader(source))
+            self.assertIn('guard-tip', path)
             self.assertEqual([row['phase'] for row in rows],
                              ['before', 'descent', 'descent'])
             self.assertEqual(rows[-1]['force_g'], '8.00000')
+            self.assertEqual(rows[0]['command'], gcmd.get_commandline())
+            self.assertEqual(rows[0]['report_file'], os.path.basename(path))
+            self.assertEqual(rows[0]['trigger_source'], 'pin')
+            self.assertEqual(rows[0]['trigger_pin'], '^th:PB9')
+            self.assertEqual(rows[0]['stop_reason'], 'force_limit')
+            self.assertIn('extra force 8 g', rows[0]['stop_detail'])
+            self.assertEqual(rows[0]['force_limit_g'], '5.0')
+            self.assertEqual(rows[0]['end_z_mm'], '19.0000')
+            self.assertEqual(rows[0]['target_z_mm'], '15.0')
 
     def test_stationary_and_no_moving_samples_are_explicit(self):
         trace = PressureTrace(FakeLoadCell())
@@ -235,6 +264,21 @@ class PressureTraceTests(unittest.TestCase):
                 rows = list(csv.DictReader(source))
             self.assertEqual([row['phase'] for row in rows],
                              ['before', 'before'])
+
+    def test_report_keeps_command_and_error_when_no_samples_arrive(self):
+        trace = PressureTrace(FakeLoadCell())
+        metadata = {'record_kind': 'test', 'source': 'liquid',
+                    'command': 'PIPETTE_PRESSURE_TEST SOURCE=LIQUID DIST=5',
+                    'stop_reason': 'error', 'stop_detail': 'ADS1220 unavailable'}
+        with tempfile.TemporaryDirectory() as directory:
+            path = trace.write_csv(directory, 20., 20., None, None, 1., metadata)
+            with open(path, newline='', encoding='utf-8') as source:
+                rows = list(csv.DictReader(source))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['command'], metadata['command'])
+            self.assertEqual(rows[0]['stop_detail'], 'ADS1220 unavailable')
+            self.assertEqual(rows[0]['sample_count'], '0')
+            self.assertEqual(rows[0]['print_time_s'], '')
 
     def test_stationary_command_writes_sampled_csv(self):
         cell = FakeLoadCell()
@@ -267,6 +311,9 @@ class PressureTraceTests(unittest.TestCase):
             def respond_info(self, message):
                 self.messages.append(message)
 
+            def get_commandline(self):
+                return 'PIPETTE_PRESSURE_TEST DIST=0 HOLD=1'
+
         with tempfile.TemporaryDirectory() as directory:
             class Printer:
                 def get_start_args(self):
@@ -290,6 +337,111 @@ class PressureTraceTests(unittest.TestCase):
             PipettePressureTest(Action()).cmd(gcmd)
             self.assertIn('stationary', gcmd.messages[0])
             self.assertIn('samples=1', gcmd.messages[1])
+            path = gcmd.messages[1].split('CSV=')[1]
+            self.assertIn('pipette_pressure_reports', path)
+            self.assertIn('test-tip', path)
+            with open(path, newline='', encoding='utf-8') as source:
+                row = next(csv.DictReader(source))
+            self.assertEqual(row['command'], gcmd.get_commandline())
+            self.assertEqual(row['stop_reason'], 'stationary')
+            self.assertEqual(row['source'], 'tip')
+            self.assertEqual(row['hold_s'], '1.0')
+
+    def test_moving_command_records_effective_settings_and_sensor_stop(self):
+        cell = FakeLoadCell()
+
+        class Reactor:
+            def monotonic(self):
+                return 0.
+
+            def pause(self, waketime):
+                pass
+
+        class Toolhead:
+            def wait_moves(self):
+                pass
+
+            def get_position(self):
+                return [0., 0., 20., 0.]
+
+            def get_status(self, eventtime):
+                return {'homed_axes': 'z'}
+
+            def get_last_move_time(self):
+                return 1.5
+
+        class Gcmd:
+            error = RuntimeError
+
+            def __init__(self):
+                self.messages = []
+
+            def get_float(self, name, default, **kwargs):
+                return {'DIST': 5., 'SPEED': 1.}.get(name, default)
+
+            def get(self, name, default):
+                return 'LIQUID' if name == 'SOURCE' else default
+
+            def get_commandline(self):
+                return 'PIPETTE_PRESSURE_TEST DIST=5 SPEED=1 SOURCE=LIQUID'
+
+            def respond_info(self, message):
+                self.messages.append(message)
+
+        with tempfile.TemporaryDirectory() as directory:
+            class Printer:
+                command_error = RuntimeError
+
+                def get_start_args(self):
+                    return {'log_file': directory + '/klippy.log'}
+
+                def lookup_object(self, name):
+                    return Toolhead()
+
+            class Action:
+                printer = Printer()
+                reactor = Reactor()
+                probe_speed = 5.
+                min_safe_z = 0.
+                probe_timeout = 15.
+                _liquid_mcu_endstop = object()
+                _liquid_pin_name = '^th:PC13'
+                _current_liq_mode = 1
+
+                class _drv:
+                    device_type = 'sp20'
+
+                def _check_driver(self):
+                    pass
+
+                def _get_pressure_load_cell(self):
+                    return cell
+
+                def _validate_liquid_move(self, distance, speed):
+                    pass
+
+            test = PipettePressureTest(Action())
+            test._select_endstop = lambda source, gcmd: object()
+
+            def run_descent(toolhead, endstop, source, target_z, speed):
+                cell.callback({'data': [(1.1, -120., 100, 0)],
+                               'errors': 0, 'overflows': 0})
+                return 18., 1.
+
+            test._run_descent = run_descent
+            gcmd = Gcmd()
+            test.cmd(gcmd)
+            path = gcmd.messages[1].split('CSV=')[1]
+            with open(path, newline='', encoding='utf-8') as source:
+                row = next(csv.DictReader(source))
+            self.assertIn('test-liquid', path)
+            self.assertEqual(row['command'], gcmd.get_commandline())
+            self.assertEqual(row['stop_reason'], 'pipette_sensor')
+            self.assertEqual(row['trigger_pin'], '^th:PC13')
+            self.assertEqual(row['max_dist_mm'], '5.0')
+            self.assertEqual(row['speed_mm_s'], '1.0000')
+            self.assertEqual(row['target_z_mm'], '15.0')
+            self.assertEqual(row['end_z_mm'], '18.0000')
 
 
 if __name__ == '__main__':

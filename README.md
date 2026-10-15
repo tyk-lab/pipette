@@ -129,13 +129,13 @@ PIPETTE_INIT WAIT=1
 # 2. Check TIP sensor
 PIPETTE_READ_TIP
 
-# 3. In-place liquid detection (ADP1000 pressure mode 1; SP20 ignores MODE)
-PIPETTE_LIQUID_DETECT MODE=1 WAIT=1
-
-# 4. Z-axis TIP pickup (moves Z down until TIP detected)
+# 3. Z-axis TIP pickup (moves Z down until TIP detected)
 PIPETTE_PICKUP_TIP MAX_DIST=30
 
-# 5. Z-axis liquid probe (moves Z down until liquid detected)
+# 4. In-place liquid detection (requires TIP; SP20 ignores MODE)
+PIPETTE_LIQUID_DETECT MODE=1 WAIT=1
+
+# 5. Z-axis liquid probe (requires TIP; moves Z down until liquid detected)
 PIPETTE_LIQUID_PROBE SPEED=2.0 RETRACT=3.0
 ```
 
@@ -179,9 +179,10 @@ Z remains at the stopping position until another command moves it.
 
 The console reports `stationary`, `pipette_sensor`, `distance_reached`, or
 `error`, plus the baseline, sample counts, force range, and sampling errors.
-A CSV beside `klippy.log` contains sample time, phase, raw counts, force in
-grams, and an **estimated** Z position. This estimate is less accurate during acceleration
-and stopping. Sensor errors, overflows, or a truncated recording make the test
+A CSV in `pipette_pressure_reports/` beside `klippy.log` contains sample time,
+phase, raw counts, force in grams, and an **estimated** Z position. This estimate
+is less accurate during acceleration and stopping. Sensor errors, overflows,
+or a truncated recording make the test
 report an error. If there are no moving samples, the trace cannot establish a
 motion baseline. Use moving traces to identify a guaranteed contact-free
 interval, normal motion preload, and drift; measure actual stopping distance
@@ -228,9 +229,20 @@ PIPETTE_PICKUP_TIP MAX_DIST=5 SPEED=1 EXTRA_TRAVEL=0 RETRACT=0
 
 Run one source at a time. On a pressure stop, Klipper reports
 `PIPETTE_PRESSURE_GUARD: stop_reason=...`, its reported end Z, and a CSV path
-beside `klippy.log`. The CSV contains the descent force samples and an estimated
-Z; it is saved on a pressure protection error, not on an ordinary sensor trigger.
+inside `pipette_pressure_reports/`. The CSV contains the descent force samples
+and an estimated Z; it is saved on a protected-descent error, not on an ordinary
+sensor trigger.
 `PIPETTE_PRESSURE_TEST` remains diagnostic and does not stop on force.
+
+New filenames include report type and sensor, for example
+`pipette-pressure-guard-tip-*.csv` or `pipette-pressure-test-liquid-*.csv`.
+Every sample row also records the original G-code command, selected sensor and
+pin/device trigger source, device type, stop reason and detail, Klipper-reported
+start/end Z, target Z and `min_safe_z`, effective motion settings, and (for guard
+stops) the force limit, motion baseline, clear time, and trip time. The first
+six sample columns retain their previous names; existing CSV files are not changed.
+A run with no samples
+still writes one metadata row with empty sample fields.
 
 ---
 

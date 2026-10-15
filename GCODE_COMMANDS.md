@@ -82,6 +82,13 @@ PIPETTE_LIQUID_DETECT [MODE=<0~5>] [WAIT=1] [WAIT_TIMEOUT=<s>]
 
 **SP20:** Sends `Ld1,<timeout_ms>` and polls `Rr1` until complete; MODE is ignored.
 
+Starting liquid detection requires a TIP. `PIPETTE_LIQUID_DETECT`,
+`PIPETTE_START_LIQUID_DETECT`, `PIPETTE_LIQUID_PROBE`, and a moving
+`PIPETTE_PRESSURE_TEST SOURCE=LIQUID` read device TIP status before sensing.
+Missing TIP or a failed TIP read aborts before sensing or Z descent. ADP1000
+`PIPETTE_LIQUID_DETECT MODE=0` only turns detection off and remains available
+without a TIP.
+
 ---
 
 ## pipette_action commands
@@ -172,11 +179,14 @@ clear period, drift limit, force limit, and stopping distance from traces before
 enabling the guard.
 
 The protected `PIPETTE_PICKUP_TIP` and `PIPETTE_LIQUID_PROBE` commands save a
-force CSV beside `klippy.log` when the guard raises an error. The console prints
-`PIPETTE_PRESSURE_GUARD: stop_reason=...`, reported end Z, sample count, and CSV
+force CSV in `pipette_pressure_reports/` beside `klippy.log` when the protected
+descent raises an error. The console prints `PIPETTE_PRESSURE_GUARD:` with
+`stop_reason=...`, reported end Z, sample count, and CSV
 path. The CSV Z column is estimated. A normal sensor trigger does not create
-this error CSV. The separate `PIPETTE_PRESSURE_TEST` command does not stop on
-force.
+this error CSV. The filename identifies `guard-tip` or `guard-liquid`, and each
+sample row contains the original command, stop reason and detail, effective
+motion settings, force limit, baseline, target Z, `min_safe_z`, and reported
+start/end Z. The separate `PIPETTE_PRESSURE_TEST` command does not stop on force.
 
 ### PIPETTE_PRESSURE_TEST
 
@@ -195,11 +205,14 @@ PIPETTE_PRESSURE_TEST DIST=20 SPEED=5 SOURCE=LIQUID
 applies only when `DIST=0`. Z must be homed and `min_safe_z` must be configured
 for a moving test. The command checks that limit and refuses an already triggered selected
 sensor. Its console summary reports the baseline, moving sample count, force
-range, sampling errors, and stop reason. A CSV is written beside `klippy.log`
-with sample time, raw counts, grams, and an **estimated** Z position. That Z
+range, sampling errors, and stop reason. A CSV is written in
+`pipette_pressure_reports/` beside `klippy.log` with sample time, raw counts,
+grams, and an **estimated** Z position. That Z
 estimate uses commanded speed and is approximate during acceleration and
 stopping. If a short move has no moving ADS1220 samples, the summary says so;
-no motion baseline can be inferred from that trace.
+no motion baseline can be inferred from that trace. Its filename identifies
+`test-tip` or `test-liquid`; each sample row includes the original command,
+effective settings, trigger source, stop reason, and reported start/end Z.
 
 ---
 
@@ -253,12 +266,12 @@ PIPETTE_INIT WAIT=1
 # 2. Check TIP sensor
 PIPETTE_READ_TIP
 
-# 3. In-place liquid test (ADP1000 with pressure mode 1)
-PIPETTE_LIQUID_DETECT MODE=1 WAIT=1
-
-# 4. Z-axis TIP pickup
+# 3. Z-axis TIP pickup
 PIPETTE_PICKUP_TIP MAX_DIST=30
 
-# 5. Z-axis liquid probe
+# 4. In-place liquid test (requires TIP)
+PIPETTE_LIQUID_DETECT MODE=1 WAIT=1
+
+# 5. Z-axis liquid probe (requires TIP)
 PIPETTE_LIQUID_PROBE SPEED=2.0 RETRACT=3.0
 ```

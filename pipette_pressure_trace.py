@@ -8,6 +8,20 @@ from statistics import median
 
 
 MAX_TRACE_SAMPLES = 30000
+REPORT_DIR_NAME = 'pipette_pressure_reports'
+REPORT_FIELDS = (
+    'report_file', 'recorded_at', 'record_kind', 'command', 'source',
+    'trigger_source', 'trigger_pin',
+    'device_type', 'stop_reason', 'stop_detail', 'start_z_mm', 'end_z_mm',
+    'target_z_mm', 'min_safe_z_mm', 'probe_timeout_s',
+    'max_dist_mm', 'speed_mm_s', 'extra_travel_mm', 'retract_mm',
+    'retract_speed_mm_s', 'hold_s', 'liquid_mode', 'force_limit_g',
+    'clear_time_s', 'drift_g_s', 'motion_baseline_g',
+    'motion_start_s', 'motion_end_s', 'trip_print_time_s',
+    'sample_count', 'sensor_errors', 'sensor_overflows', 'truncated',
+)
+SAMPLE_FIELDS = ('print_time_s', 'phase', 'z_est_mm',
+                 'force_g', 'raw_counts', 'tare_counts')
 
 
 class PressureTrace:
@@ -39,26 +53,48 @@ class PressureTrace:
         return True
 
     @staticmethod
-    def log_directory(printer):
+    def report_directory(printer):
         log_file = printer.get_start_args().get('log_file')
         if not log_file or not os.path.isdir(os.path.dirname(log_file)):
             raise printer.command_error(
-                "PIPETTE_PRESSURE_TEST requires a Klipper log directory")
-        return os.path.dirname(log_file)
+                "Pipette pressure report requires a Klipper log directory")
+        directory = os.path.join(os.path.dirname(log_file), REPORT_DIR_NAME)
+        os.makedirs(directory, exist_ok=True)
+        return directory
 
     def write_csv(self, directory, start_z, end_z, motion_start,
-                  motion_end, speed):
-        name = "pipette-pressure-%s.csv" % (
-            datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+                  motion_end, speed, metadata=None):
+        metadata = dict(metadata or {})
+        kind = metadata.get('record_kind', 'trace')
+        source = metadata.get('source', 'unknown')
+        if kind not in ('test', 'guard', 'trace') or source not in ('tip', 'liquid', 'unknown'):
+            raise ValueError('Invalid pressure report kind or source')
+        now = datetime.datetime.now().astimezone()
+        name = "pipette-pressure-%s-%s-%s.csv" % (
+            kind, source, now.strftime('%Y%m%d-%H%M%S-%f'))
         path = os.path.join(directory, name)
+        metadata.update({
+            'report_file': name,
+            'recorded_at': now.isoformat(timespec='milliseconds'),
+            'start_z_mm': '%.4f' % start_z,
+            'end_z_mm': '%.4f' % end_z,
+            'speed_mm_s': '%.4f' % speed,
+            'motion_start_s': ('%.6f' % motion_start
+                               if motion_start is not None else ''),
+            'motion_end_s': ('%.6f' % motion_end
+                             if motion_end is not None else ''),
+            'sample_count': len(self.samples),
+            'sensor_errors': self.errors,
+            'sensor_overflows': self.overflows,
+            'truncated': int(self.truncated),
+        })
         with open(path, 'x', newline='', encoding='utf-8') as output:
-            writer = csv.writer(output)
-            writer.writerow(('print_time_s', 'phase', 'z_est_mm',
-                             'force_g', 'raw_counts', 'tare_counts'))
+            writer = csv.DictWriter(output, SAMPLE_FIELDS + REPORT_FIELDS)
+            writer.writeheader()
             for print_time, force_g, counts, tare in self.samples:
                 if motion_start is None or print_time < motion_start:
                     phase, z_est = 'before', start_z
-                elif print_time <= motion_end:
+                elif motion_end is None or print_time <= motion_end:
                     phase = 'descent'
                     # Estimated from commanded speed; acceleration and stop
                     # latency make this unsuitable as an exact contact Z.
@@ -66,10 +102,16 @@ class PressureTrace:
                                 max(0., print_time - motion_start))
                 else:
                     phase, z_est = 'after', end_z
-                writer.writerow(("%.6f" % print_time, phase,
-                                 "%.4f" % z_est,
-                                 "%.5f" % force_g if force_g is not None else '',
-                                 counts, tare))
+                writer.writerow(dict(metadata, **{
+                    'print_time_s': '%.6f' % print_time,
+                    'phase': phase,
+                    'z_est_mm': '%.4f' % z_est,
+                    'force_g': '%.5f' % force_g if force_g is not None else '',
+                    'raw_counts': counts,
+                    'tare_counts': tare,
+                }))
+            if not self.samples:
+                writer.writerow(metadata)
         return path
 
     def summary(self, motion_start, motion_end):
@@ -78,7 +120,8 @@ class PressureTrace:
                and (motion_start is None or s[0] < motion_start)]
         moving = [s[1] for s in self.samples
                   if s[1] is not None and motion_start is not None
-                  and motion_start <= s[0] <= motion_end]
+                  and motion_start <= s[0]
+                  and (motion_end is None or s[0] <= motion_end)]
         baseline = median(pre) if pre else None
         if baseline is None:
             return "no stationary baseline samples; move_samples=%d" % len(moving)
@@ -91,19 +134,62 @@ class PressureTrace:
                  min(extra), max(extra)))
 
 
+def _trigger_source(action, source):
+    pin = getattr(action, '_%s_mcu_endstop' % source, None)
+    return 'pin' if pin is not None else 'device_poll'
+
+
+def _guard_stop_reason(reason):
+    if reason is None:
+        return 'move_error'
+    if reason.startswith('ADS1220 pressure protection:'):
+        return 'force_limit'
+    if reason.startswith('ADS1220 samples stopped'):
+        return 'samples_stale'
+    if reason.startswith('insufficient ADS1220 samples'):
+        return 'baseline_error'
+    return 'sensor_error'
+
+
 def report_guard_failure(trace, directory, gcmd, toolhead, start_z, speed,
-                         guard):
+                         guard, action, source, params, extra_travel,
+                         move_error=None):
     """Save the descent samples after a pressure stop without masking its error."""
     try:
         end_z = toolhead.get_position()[2]
         motion_end = toolhead.get_last_move_time()
+        detail = guard.reason or str(move_error)
+        metadata = {
+            'record_kind': 'guard',
+            'command': gcmd.get_commandline(),
+            'source': source,
+            'trigger_source': _trigger_source(action, source),
+            'trigger_pin': getattr(action, '_%s_pin_name' % source, '') or '',
+            'device_type': getattr(getattr(action, '_drv', None), 'device_type', ''),
+            'stop_reason': _guard_stop_reason(guard.reason),
+            'stop_detail': detail,
+            'max_dist_mm': params['max_dist'],
+            'target_z_mm': start_z - params['max_dist'],
+            'min_safe_z_mm': action.min_safe_z,
+            'probe_timeout_s': (action.probe_timeout if source == 'liquid' else ''),
+            'extra_travel_mm': extra_travel,
+            'retract_mm': params['retract_dist'],
+            'retract_speed_mm_s': params['retract_speed'],
+            'liquid_mode': (getattr(action, '_current_liq_mode', '')
+                            if source == 'liquid' else ''),
+            'force_limit_g': guard._limit_g,
+            'clear_time_s': guard._settle_time,
+            'drift_g_s': guard._drift_g_per_s,
+            'motion_baseline_g': guard._baseline,
+            'trip_print_time_s': guard.trip_time,
+        }
         path = trace.write_csv(directory, start_z, end_z,
-                               guard._start_time, motion_end, speed)
+                               guard._start_time, motion_end, speed, metadata)
         gcmd.respond_info(
             'PIPETTE_PRESSURE_GUARD: stop_reason=%s; start_z=%.3f '
             'end_z=%.3f; %s; samples=%d errors=%d overflows=%d '
             'truncated=%s CSV=%s' %
-            (guard.reason, start_z, end_z,
+            (detail, start_z, end_z,
              trace.summary(guard._start_time, motion_end),
              len(trace.samples), trace.errors, trace.overflows,
              trace.truncated, path))
@@ -179,7 +265,7 @@ class PipettePressureTest:
             raise gcmd.error('Pressure test descent may not exceed 30 seconds')
         if distance and source == 'liquid':
             action._validate_liquid_move(distance, speed)
-        directory = PressureTrace.log_directory(self._printer)
+        directory = PressureTrace.report_directory(self._printer)
         toolhead = self._printer.lookup_object('toolhead')
         toolhead.wait_moves()
         start_z = toolhead.get_position()[2]
@@ -222,8 +308,34 @@ class PipettePressureTest:
         finally:
             trace.stop()
 
+        trace_error = bool(trace.errors or trace.overflows or trace.truncated)
+        if move_error is None and trace_error:
+            stop_reason = 'trace_error'
+        stop_detail = (str(move_error) if move_error is not None else
+                       'Pressure trace is incomplete or contains sensor errors'
+                       if trace_error else '')
+        metadata = {
+            'record_kind': 'test',
+            'command': gcmd.get_commandline(),
+            'source': source,
+            'trigger_source': (_trigger_source(action, source)
+                               if distance else 'none'),
+            'trigger_pin': ((getattr(action, '_%s_pin_name' % source, '') or '')
+                            if distance else ''),
+            'device_type': getattr(getattr(action, '_drv', None), 'device_type', ''),
+            'stop_reason': stop_reason,
+            'stop_detail': stop_detail,
+            'max_dist_mm': distance,
+            'target_z_mm': target_z,
+            'min_safe_z_mm': getattr(action, 'min_safe_z', ''),
+            'probe_timeout_s': (getattr(action, 'probe_timeout', '')
+                                if distance and source == 'liquid' else ''),
+            'hold_s': hold if not distance else '',
+            'liquid_mode': (getattr(action, '_current_liq_mode', '')
+                            if distance and source == 'liquid' else ''),
+        }
         path = trace.write_csv(directory, start_z, end_z, motion_start,
-                               motion_end, speed)
+                               motion_end, speed, metadata)
         gcmd.respond_info(
             'PIPETTE_PRESSURE_TEST: %s; start_z=%.3f end_z=%.3f; %s'
             % (stop_reason, start_z, end_z,
@@ -235,5 +347,5 @@ class PipettePressureTest:
              trace.truncated, path))
         if move_error is not None:
             raise move_error
-        if trace.errors or trace.overflows or trace.truncated:
+        if trace_error:
             raise gcmd.error('Pressure trace is incomplete or contains sensor errors')
