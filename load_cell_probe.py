@@ -314,7 +314,7 @@ class LoadCellProbingMove:
 
     # pauses for the last move to complete and then
     # sets the endstop tare value and range
-    def _pause_and_tare(self, gcmd):
+    def _pause_and_tare(self, gcmd, trigger_force_g=None):
         collector = self._start_collector()
         num_samples = self._config_helper.get_tare_samples(gcmd)
         # use collect_min collected samples are not wasted
@@ -333,9 +333,22 @@ class LoadCellProbingMove:
         sos_filter = self._mcu_trigger_analog.get_sos_filter()
         sos_filter.set_offset_scale(int(-tare_counts), gpc)
         # update trigger
-        trigger_val = self._config_helper.get_trigger_force_grams(gcmd)
+        trigger_val = (self._config_helper.get_trigger_force_grams(gcmd)
+                       if trigger_force_g is None else trigger_force_g)
         trigger_frac_grams = int(trigger_val * FRAC_GRAMS_CONV)
         self._mcu_trigger_analog.set_trigger("abs_ge", trigger_frac_grams)
+
+    def prepare_pipette_pressure_guard(self, force_g):
+        """Tare and arm the existing MCU analog endstop for one pipette move."""
+        if not self._load_cell.is_calibrated():
+            raise self._printer.command_error("Load cell is not calibrated")
+        safety_limit = self._config_helper.get_safety_limit_grams()
+        if force_g >= safety_limit:
+            raise self._printer.command_error(
+                "MCU pressure limit must be below force_safety_limit %.3f g"
+                % safety_limit)
+        self._pause_and_tare(None, force_g)
+        return self._mcu_trigger_analog
 
     # Probe towards z_min until the trigger_analog on the MCU triggers
     def probing_move(self, gcmd):
@@ -523,6 +536,9 @@ class LoadCellPrinterProbe:
     def get_load_cell(self):
         """Expose the calibrated sensor to other Klipper modules."""
         return self._load_cell
+
+    def prepare_pipette_pressure_guard(self, force_g):
+        return self._load_cell_probing_move.prepare_pipette_pressure_guard(force_g)
 
     def get_offsets(self, gcmd=None):
         return self._probe_offsets.get_offsets(gcmd)
