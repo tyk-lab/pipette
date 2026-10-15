@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # deploy_to_klipper.sh
-# 将本目录下的驱动文件链接到 Klipper，并同步打包的两个 Klipper 核心文件。
+# 将本目录下的插件文件链接到 Klipper 的 klippy/extras 目录。
 # 同时为 pipette_driver.py 创建 pipette.py 别名（Klipper section 名匹配要求）
 #
 # 用法：
@@ -12,8 +12,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXTRAS_DIR="${1:-${HOME}/klipper/klippy/extras}"
-PACKAGED_KLIPPER_ROOT="${SCRIPT_DIR}/klipper"
-KLIPPER_BASE_COMMIT="9e5193224a68cd60949002ed526564695d8c7019"
 
 # 需要软链接的文件：源文件名 -> 目标链接名（相同则只写一次）
 declare -A LINKS=(
@@ -36,56 +34,9 @@ if [[ ! -d "$EXTRAS_DIR" ]]; then
     exit 1
 fi
 
-# MCU 压力触发与数字引脚共用 Klipper trsync，需要同版本的两个核心文件。
-# 在任何文件变更前核对 Git 版本及目标文件，避免覆盖另一版本的 Klipper。
-TARGET_KLIPPER_ROOT="$(cd "$EXTRAS_DIR/../.." && pwd -P)"
-CORE_FILES=("klippy/mcu.py" "klippy/extras/trigger_analog.py")
-target_git_root="$(git -C "$TARGET_KLIPPER_ROOT" rev-parse --show-toplevel)" || {
-    echo "[ERROR] 目标 Klipper 不是可核对的 Git 工作区"
-    exit 1
-}
-if [[ "$target_git_root" != "$TARGET_KLIPPER_ROOT" ]]; then
-    echo "[ERROR] 目标目录不是 Klipper Git 工作区根目录: $TARGET_KLIPPER_ROOT"
-    exit 1
-fi
-target_commit="$(git -C "$TARGET_KLIPPER_ROOT" rev-parse HEAD)"
-if [[ "$target_commit" != "$KLIPPER_BASE_COMMIT" ]]; then
-    echo "[ERROR] 目标 Klipper 版本不同，需手工合并 MCU 压力补丁"
-    exit 1
-fi
-for rel_path in "${CORE_FILES[@]}"; do
-    src_path="$PACKAGED_KLIPPER_ROOT/$rel_path"
-    dst_path="$TARGET_KLIPPER_ROOT/$rel_path"
-    if [[ ! -f "$src_path" || ! -f "$dst_path" ]]; then
-        echo "[ERROR] 缺少 Klipper 核心文件: $rel_path"
-        exit 1
-    fi
-    if [[ -L "$dst_path" ]]; then
-        echo "[ERROR] 目标核心文件是软链接，需手工核对: $dst_path"
-        exit 1
-    fi
-    if ! cmp -s "$src_path" "$dst_path" &&
-       ! git -C "$TARGET_KLIPPER_ROOT" diff --quiet HEAD -- "$rel_path"; then
-        echo "[ERROR] 目标 $rel_path 有独立改动，需手工合并 MCU 压力补丁"
-        exit 1
-    fi
-done
-
 echo "源目录  : $SCRIPT_DIR"
 echo "目标目录: $EXTRAS_DIR"
 echo ""
-
-for rel_path in "${CORE_FILES[@]}"; do
-    src_path="$PACKAGED_KLIPPER_ROOT/$rel_path"
-    dst_path="$TARGET_KLIPPER_ROOT/$rel_path"
-    if cmp -s "$src_path" "$dst_path"; then
-        continue
-    fi
-    backup="${dst_path}.bak.$(date +%Y%m%d_%H%M%S)"
-    cp -p "$dst_path" "$backup"
-    cp "$src_path" "$dst_path"
-    echo "[CORE] $rel_path (backup: $backup)"
-done
 
 # ---- 创建软链接 ----
 for src_name in "${!LINKS[@]}"; do
