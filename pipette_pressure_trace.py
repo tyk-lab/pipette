@@ -16,6 +16,7 @@ REPORT_FIELDS = (
     'target_z_mm', 'min_safe_z_mm', 'probe_timeout_s',
     'max_dist_mm', 'speed_mm_s', 'extra_travel_mm', 'retract_mm',
     'retract_speed_mm_s', 'hold_s', 'liquid_mode', 'force_limit_g',
+    'mcu_force_limit_g',
     'clear_time_s', 'drift_g_s', 'motion_baseline_g',
     'motion_start_s', 'motion_end_s', 'trip_print_time_s',
     'sample_count', 'sensor_errors', 'sensor_overflows', 'truncated',
@@ -153,12 +154,17 @@ def _guard_stop_reason(reason):
 
 def report_guard_failure(trace, directory, gcmd, toolhead, start_z, speed,
                          guard, action, source, params, extra_travel,
-                         move_error=None):
+                         move_error=None, mcu_endstop=None):
     """Save the descent samples after a pressure stop without masking its error."""
     try:
         end_z = toolhead.get_position()[2]
         motion_end = toolhead.get_last_move_time()
-        detail = guard.reason or str(move_error)
+        mcu_reason = getattr(mcu_endstop, 'pressure_reason', None)
+        detail = mcu_reason or guard.reason or str(move_error)
+        stop_reason = (_guard_stop_reason(guard.reason)
+                       if mcu_reason is None else
+                       'mcu_force_limit' if 'pressure protection' in mcu_reason
+                       else 'mcu_sensor_error')
         metadata = {
             'record_kind': 'guard',
             'command': gcmd.get_commandline(),
@@ -166,7 +172,7 @@ def report_guard_failure(trace, directory, gcmd, toolhead, start_z, speed,
             'trigger_source': _trigger_source(action, source),
             'trigger_pin': getattr(action, '_%s_pin_name' % source, '') or '',
             'device_type': getattr(getattr(action, '_drv', None), 'device_type', ''),
-            'stop_reason': _guard_stop_reason(guard.reason),
+            'stop_reason': stop_reason,
             'stop_detail': detail,
             'max_dist_mm': params['max_dist'],
             'target_z_mm': start_z - params['max_dist'],
@@ -178,10 +184,13 @@ def report_guard_failure(trace, directory, gcmd, toolhead, start_z, speed,
             'liquid_mode': (getattr(action, '_current_liq_mode', '')
                             if source == 'liquid' else ''),
             'force_limit_g': guard._limit_g,
+            'mcu_force_limit_g': getattr(mcu_endstop, '_mcu_force_g', '')
+                                  if mcu_endstop is not None else '',
             'clear_time_s': guard._settle_time,
             'drift_g_s': guard._drift_g_per_s,
             'motion_baseline_g': guard._baseline,
-            'trip_print_time_s': guard.trip_time,
+            'trip_print_time_s': (mcu_endstop.pressure_trip_time
+                                  if mcu_reason is not None else guard.trip_time),
         }
         path = trace.write_csv(directory, start_z, end_z,
                                guard._start_time, motion_end, speed, metadata)

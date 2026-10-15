@@ -12,6 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXTRAS_DIR="${1:-${HOME}/klipper/klippy/extras}"
+SOURCE_KLIPPER_ROOT="${SCRIPT_DIR}/../klipper"
 
 # 需要软链接的文件：源文件名 -> 目标链接名（相同则只写一次）
 declare -A LINKS=(
@@ -34,9 +35,55 @@ if [[ ! -d "$EXTRAS_DIR" ]]; then
     exit 1
 fi
 
+# MCU 压力触发与数字引脚共用 Klipper trsync，需要同版本的两个核心文件。
+# 在任何文件变更前核对 Git 版本及目标文件，避免覆盖另一版本的 Klipper。
+TARGET_KLIPPER_ROOT="$(cd "$EXTRAS_DIR/../.." && pwd)"
+CORE_FILES=("klippy/mcu.py" "klippy/extras/trigger_analog.py")
+if [[ ! -d "$SOURCE_KLIPPER_ROOT/.git" && ! -f "$SOURCE_KLIPPER_ROOT/.git" ]]; then
+    echo "[ERROR] 缺少源码 Klipper Git 目录: $SOURCE_KLIPPER_ROOT"
+    exit 1
+fi
+source_commit="$(git -C "$SOURCE_KLIPPER_ROOT" rev-parse HEAD)"
+target_commit="$(git -C "$TARGET_KLIPPER_ROOT" rev-parse HEAD)" || {
+    echo "[ERROR] 目标 Klipper 不是可核对的 Git 工作区"
+    exit 1
+}
+for rel_path in "${CORE_FILES[@]}"; do
+    src_path="$SOURCE_KLIPPER_ROOT/$rel_path"
+    dst_path="$TARGET_KLIPPER_ROOT/$rel_path"
+    if [[ ! -f "$src_path" || ! -f "$dst_path" ]]; then
+        echo "[ERROR] 缺少 Klipper 核心文件: $rel_path"
+        exit 1
+    fi
+    if cmp -s "$src_path" "$dst_path"; then
+        continue
+    fi
+    if [[ -L "$dst_path" ]]; then
+        echo "[ERROR] 目标核心文件是软链接，需手工核对: $dst_path"
+        exit 1
+    fi
+    if [[ "$source_commit" != "$target_commit" ]] ||
+       ! git -C "$TARGET_KLIPPER_ROOT" diff --quiet HEAD -- "$rel_path"; then
+        echo "[ERROR] 目标 $rel_path 有独立改动或 Klipper 版本不同，需手工合并 MCU 压力补丁"
+        exit 1
+    fi
+done
+
 echo "源目录  : $SCRIPT_DIR"
 echo "目标目录: $EXTRAS_DIR"
 echo ""
+
+for rel_path in "${CORE_FILES[@]}"; do
+    src_path="$SOURCE_KLIPPER_ROOT/$rel_path"
+    dst_path="$TARGET_KLIPPER_ROOT/$rel_path"
+    if cmp -s "$src_path" "$dst_path"; then
+        continue
+    fi
+    backup="${dst_path}.bak.$(date +%Y%m%d_%H%M%S)"
+    cp -p "$dst_path" "$backup"
+    cp "$src_path" "$dst_path"
+    echo "[CORE] $rel_path (backup: $backup)"
+done
 
 # ---- 创建软链接 ----
 for src_name in "${!LINKS[@]}"; do

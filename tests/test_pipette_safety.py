@@ -1,5 +1,7 @@
+import importlib.util
 import pathlib
 import sys
+import types
 import unittest
 from unittest.mock import Mock, patch
 
@@ -256,14 +258,33 @@ class ActionPreflightTests(unittest.TestCase):
 
 
 class PressureSourceTests(unittest.TestCase):
+    def test_runtime_pressure_command_is_registered(self):
+        module = load_action_module()
+        action = object.__new__(module.PipetteAction)
+        action.gcode = Mock()
+        action.printer = Mock()
+        action.reactor = Mock()
+        action.pressure_guard_settings = Mock()
+        action._register_commands()
+        registrations = action.gcode.register_command.call_args_list
+        commands = {call.args[0]: call.args[1] for call in registrations}
+        self.assertIs(commands['PIPETTE_PRESSURE_GUARD_SET'],
+                      action.pressure_guard_settings.cmd_set)
+
     def test_each_descent_uses_only_its_own_force_limit(self):
         module = load_action_module()
         action = object.__new__(module.PipetteAction)
         action.command_error = RuntimeError
         action.min_safe_z = 0.
-        action.pressure_guard_settings = {
-            'tip': (250., 0.2), 'liquid': (5., 0.3)}
-        action.pressure_guard_drift_g_s = 0.
+        class Settings:
+            drift_g_s = 0.
+            values = {'tip': (250., 0.2, None),
+                      'liquid': (5., 0.3, None)}
+
+            def get(self, source):
+                return self.values[source]
+
+        action.pressure_guard_settings = Settings()
         action.reactor = Mock()
         action._get_pressure_load_cell = Mock(return_value=object())
 
@@ -289,7 +310,7 @@ class PressureSourceTests(unittest.TestCase):
         gcmd = Mock()
         params = {'max_dist': 20., 'probe_speed': 5.,
                   'retract_dist': 0., 'retract_speed': 5.}
-        endstop = object()
+        endstop = Mock()
 
         with (patch.object(module.pipette_pressure_guard, 'MovingPressureGuard') as guard,
               patch.object(module.pipette_pressure_guard, 'GuardedEndstop') as wrapped,
@@ -310,12 +331,37 @@ class PressureSourceTests(unittest.TestCase):
                         self.assertEqual(toolhead.moves[0][0][2], 87.)
             self.assertEqual(guard.call_count, 2)
 
-            action.pressure_guard_settings['liquid'] = (None, None)
+            action.pressure_guard_settings.values['liquid'] = (None, None, None)
             action._z_probe_via_homing(
                 gcmd, Toolhead(), params, endstop, 'liquid',
                 pressure_source='liquid')
             self.assertIs(homing.probing_move.call_args.args[0], endstop)
             self.assertEqual(guard.call_count, 2)
+
+            pressure_endstop = Mock()
+            shared_mcu = object()
+            pressure_endstop.get_mcu.return_value = shared_mcu
+            endstop.get_dispatch.return_value.get_mcu.return_value = shared_mcu
+            probe = Mock()
+            probe.prepare_pipette_pressure_guard.return_value = pressure_endstop
+            action.printer.lookup_object.side_effect = (
+                lambda name: probe if name == 'probe' else homing)
+            action.pressure_guard_settings.values['tip'] = (250., 0.2, 300.)
+            action._z_probe_via_homing(
+                gcmd, Toolhead(), params, endstop, 'tip',
+                pressure_source='tip')
+            probe.prepare_pipette_pressure_guard.assert_called_once_with(300.)
+            self.assertEqual(wrapped.call_args.args[-2:],
+                             (pressure_endstop, 300.))
+
+            action.pressure_guard_settings.values['liquid'] = (5., 0.3, 100.)
+            action._z_probe_via_homing(
+                gcmd, Toolhead(), params, endstop, 'liquid',
+                pressure_source='liquid')
+            self.assertEqual(probe.prepare_pipette_pressure_guard.call_args.args,
+                             (100.,))
+            self.assertEqual(wrapped.call_args.args[-2:],
+                             (pressure_endstop, 100.))
 
             homing.probing_move.side_effect = RuntimeError('pressure stop')
             guard.return_value.reason = 'ADS1220 pressure protection'
@@ -327,6 +373,80 @@ class PressureSourceTests(unittest.TestCase):
                         pressure_source='tip')
                 report.assert_called_once()
                 trace.return_value.stop.assert_called()
+
+
+class SharedMcuPressureTests(unittest.TestCase):
+    @staticmethod
+    def load_mcu_modules():
+        load_action_module()
+        stubs = {name: types.ModuleType(name)
+                 for name in ('serialhdl', 'msgproto', 'pins',
+                              'chelper', 'clocksync')}
+        with patch.dict(sys.modules, stubs):
+            import mcu
+            from extras import trigger_analog
+            spec = importlib.util.spec_from_file_location(
+                'extras.pipette_load_cell_probe_test',
+                pathlib.Path('pipette/load_cell_probe.py').resolve())
+            load_cell_probe = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(load_cell_probe)
+        return mcu, trigger_analog, load_cell_probe
+
+    def test_analog_arms_on_pin_dispatch_and_reports_force_reason(self):
+        _, trigger_analog, _ = self.load_mcu_modules()
+
+        analog = object.__new__(trigger_analog.MCU_trigger_analog)
+        analog._mcu = Mock()
+        analog._mcu.print_time_to_clock.return_value = 1000
+        analog._mcu.seconds_to_clock.return_value = 10
+        analog._mcu.is_fileoutput.return_value = False
+        analog._sensor = Mock()
+        analog._sensor.get_samples_per_second.return_value = 660
+        analog._oid = 8
+        analog._home_cmd = Mock()
+        analog._reset_filter = Mock()
+        analog._clear_home = Mock(return_value=1.25)
+        dispatch = Mock()
+        dispatch.get_mcu.return_value = analog._mcu
+        dispatch.get_oid.return_value = 42
+
+        analog.home_start_shared(1., dispatch)
+        args = analog._home_cmd.send.call_args.args[0]
+        self.assertEqual(args[1:4], [42, analog.SHARED_REASON_FORCE,
+                                     analog.SHARED_REASON_ERROR])
+        self.assertEqual(analog.home_wait_shared(
+            analog.SHARED_REASON_FORCE, 2.), 1.25)
+        self.assertEqual(analog.get_last_trigger_time(), 1.25)
+
+    def test_pin_endstop_exposes_shared_reason_without_fake_pin_time(self):
+        mcu, _, _ = self.load_mcu_modules()
+
+        endstop = object.__new__(mcu.MCU_endstop)
+        endstop._dispatch = Mock()
+        endstop._dispatch.stop.return_value = 5
+        endstop._home_cmd = Mock()
+        endstop._oid = 7
+        self.assertEqual(endstop.home_wait_with_reason(2.), (0., 5))
+        endstop._dispatch.stop.assert_called_once()
+
+    def test_mcu_limit_must_fit_load_cell_safety_range(self):
+        _, _, load_cell_probe = self.load_mcu_modules()
+        move = object.__new__(load_cell_probe.LoadCellProbingMove)
+        move._load_cell = Mock()
+        move._load_cell.is_calibrated.return_value = True
+        move._config_helper = Mock()
+        move._config_helper.get_safety_limit_grams.return_value = 2000.
+        move._printer = Mock()
+        move._printer.command_error = RuntimeError
+        move._pause_and_tare = Mock()
+        move._mcu_trigger_analog = object()
+
+        with self.assertRaisesRegex(RuntimeError, 'force_safety_limit'):
+            move.prepare_pipette_pressure_guard(2500.)
+        move._pause_and_tare.assert_not_called()
+        self.assertIs(move.prepare_pipette_pressure_guard(300.),
+                      move._mcu_trigger_analog)
+        move._pause_and_tare.assert_called_once_with(None, 300.)
 
 
 if __name__ == '__main__':

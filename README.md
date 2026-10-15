@@ -79,9 +79,14 @@ chmod +x flash_rp2040_bootsel.sh
 ./deploy_to_klipper.sh
 ```
 
-The script links this directory's modules, including `load_cell_probe.py`, into
-`~/klipper/klippy/extras/` and restarts Klipper. If a target is a regular file,
-the script saves it with a timestamped `.bak` suffix before creating the link.
+The script first checks that the source and installed Klipper Git commits match,
+then backs up and copies the two core files needed for shared MCU pin/pressure
+stopping (`klippy/mcu.py` and `klippy/extras/trigger_analog.py`). It refuses an
+independently modified or different-version target for manual merging. It then
+links this directory's modules, including `load_cell_probe.py`, into
+`~/klipper/klippy/extras/` and restarts Klipper. Existing regular targets get
+timestamped `.bak` copies. Run this script from the full project checkout;
+the separate `pipette` backup directory does not contain its Git source.
 
 ### 3. Configure printer.cfg
 
@@ -191,20 +196,23 @@ limit.
 
 ### Enable protection after measuring
 
-In `[pipette_action]`, configure `pressure_guard_tip_force_g` and
-`pressure_guard_tip_clear_time` for TIP pickup, or
-`pressure_guard_liquid_force_g` and `pressure_guard_liquid_clear_time` for
-liquid probing. Each limit is the allowed **absolute force change from the
-moving baseline**, in grams. A missing force limit disables protection for
-that source only. Each clear time must be verified contact-free from the start
-of its descent. Normal TIP insertion can add about 200 g before `tip_pin`
-triggers in the recorded tests, while liquid contact showed no sustained 5 g
-change. Those observations do not establish safe stop limits. The optional
+In `[pipette_action]`, configure the host limits
+`pressure_guard_tip_force_g` / `pressure_guard_liquid_force_g` and their
+corresponding `*_clear_time` values. Optional MCU limits use
+`pressure_guard_tip_mcu_force_g` / `pressure_guard_liquid_mcu_force_g`.
+The MCU path shares one hardware stop channel with the selected physical pin;
+the pin is still normal success and pressure is an error. It tares immediately
+before descent and checks force on the sensor MCU during motion, bypassing the
+host's 100 ms ADS1220 batch. Klipper trsync still relays the stop to the Z MCU
+when the load cell and Z steppers are on different MCUs. The host path remains
+a backup and measures **absolute
+force change from its moving baseline**. A missing host limit disables that
+source's guard. Each host clear time must be verified contact-free. The optional
 `pressure_guard_drift_g_s` defaults to 0; increase it only if moving traces
 show repeatable slow baseline drift. See the commented settings in
 [`pipette.cfg`](pipette.cfg).
 
-When enabled, the guard learns the motion baseline during the clear interval.
+When enabled, the host guard learns the motion baseline during the clear interval.
 A sustained excess force, invalid readings, or lost ADS1220 samples stops Z and
 reports an error. A protection stop does not run `EXTRA_TRAVEL` or retract
 automatically. ADS1220 readings arrive in batches, so this stop can lag an MCU
@@ -212,12 +220,18 @@ pin trigger. The guard ends when the selected TIP or liquid signal triggers;
 TIP's subsequent 3 mm seating move is outside the guard. Measure actual
 stopping distance before relying on either threshold.
 
-The machine example in `../config/pipette.cfg` enables provisional test limits:
-250 g for TIP and 5 g for liquid, each with a 0.15 s contact-free baseline.
-Offline replay of the available normal traces did not trip these limits. This
-does not establish a safe collision force or stopping distance. At the configured
-5 mm/s probe speed, the 0.15 s baseline interval covers about 0.75 mm of descent
-without force detection. Keep the first collision test slow and its travel short.
+The machine example in `../config/pipette.cfg` enables provisional host limits
+of 250 g TIP and 5 g liquid, plus faster MCU limits of 300 g TIP and 100 g liquid.
+The MCU limits are higher because the available normal traces contain brief raw
+spikes of about 260 g TIP and 78 g liquid relative to the pre-move baseline.
+These values still need real stopping-distance verification. The host's 0.15 s
+baseline interval covers about 0.75 mm at 5 mm/s; the MCU path is armed before
+motion and has no host baseline delay.
+
+Use `PIPETTE_PRESSURE_GUARD_SET` to change any of the six limits/times or the
+host drift for subsequent probes without editing cfg. It prints current values
+with no parameters and resets to cfg after Klipper restarts. See
+[GCODE_COMMANDS.md](GCODE_COMMANDS.md) for syntax.
 
 After positioning Z near the test object and checking `min_safe_z`, the protected
 commands can be exercised with bounded travel, for example:
@@ -239,7 +253,7 @@ New filenames include report type and sensor, for example
 Every sample row also records the original G-code command, selected sensor and
 pin/device trigger source, device type, stop reason and detail, Klipper-reported
 start/end Z, target Z and `min_safe_z`, effective motion settings, and (for guard
-stops) the force limit, motion baseline, clear time, and trip time. The first
+stops) the host and MCU limits, motion baseline, clear time, and trip time. The first
 six sample columns retain their previous names; existing CSV files are not changed.
 A run with no samples
 still writes one metadata row with empty sample fields.
@@ -294,8 +308,10 @@ still writes one metadata row with empty sample fields.
 | `liquid_pin` | *(none)* | Hardware endstop pin for liquid detection |
 | `pressure_guard_tip_force_g` | *(none)* | TIP abnormal-force limit before TIP detection; absent disables TIP guard |
 | `pressure_guard_tip_clear_time` | *(none)* | Required TIP contact-free baseline period |
+| `pressure_guard_tip_mcu_force_g` | *(none)* | Fast MCU TIP force limit; requires `tip_pin` |
 | `pressure_guard_liquid_force_g` | *(none)* | Liquid collision-force limit before liquid detection; absent disables liquid guard |
 | `pressure_guard_liquid_clear_time` | *(none)* | Required liquid contact-free baseline period |
+| `pressure_guard_liquid_mcu_force_g` | *(none)* | Fast MCU liquid force limit; requires `liquid_pin` |
 | `pressure_guard_drift_g_s` | 0 | Maximum slow motion-baseline drift compensation |
 
 For pipette detection, a configured trigger pin replaces device-status polling

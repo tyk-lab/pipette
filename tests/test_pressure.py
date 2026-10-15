@@ -3,7 +3,9 @@ import os
 import tempfile
 import unittest
 
-from pipette.pipette_pressure_guard import GuardedEndstop, MovingPressureGuard
+from pipette.pipette_pressure_guard import (
+    GuardedEndstop, MovingPressureGuard, PressureGuardSettings,
+    validate_mcu_pressure_support)
 from pipette.pipette_pressure_trace import (
     PipettePressureTest, PressureTrace, report_guard_failure)
 
@@ -23,6 +25,78 @@ def samples(start, stop, force, step=0.005):
     count = round((stop - start) / step)
     return [(round(start + i * step, 6), force, 100, 0)
             for i in range(count)]
+
+
+class PressureGuardSettingsTests(unittest.TestCase):
+    def setUp(self):
+        class Config:
+            error = RuntimeError
+
+            def getfloat(self, name, default, **kwargs):
+                values = {
+                    'pressure_guard_tip_force_g': 250.,
+                    'pressure_guard_tip_clear_time': 0.15,
+                    'pressure_guard_tip_mcu_force_g': 300.,
+                    'pressure_guard_liquid_force_g': 5.,
+                    'pressure_guard_liquid_clear_time': 0.15,
+                    'pressure_guard_liquid_mcu_force_g': 100.,
+                }
+                return values.get(name, default)
+
+        self.settings = PressureGuardSettings(Config())
+
+    def test_updates_next_probe_settings_without_changing_other_source(self):
+        class Gcmd:
+            error = RuntimeError
+
+            def __init__(self):
+                self.messages = []
+
+            def get_float(self, name, default, **kwargs):
+                return {'TIP_FORCE_G': 240.,
+                        'TIP_MCU_FORCE_G': 280.}.get(name, default)
+
+            def respond_info(self, message):
+                self.messages.append(message)
+
+        gcmd = Gcmd()
+        self.settings.cmd_set(gcmd)
+        self.assertEqual(self.settings.get('tip'), (240., 0.15, 280.))
+        self.assertEqual(self.settings.get('liquid'), (5., 0.15, 100.))
+        self.assertIn('effective from the next probe', gcmd.messages[0])
+
+    def test_invalid_combination_does_not_change_any_setting(self):
+        class Gcmd:
+            error = RuntimeError
+
+            def get_float(self, name, default, **kwargs):
+                return 0. if name == 'TIP_FORCE_G' else default
+
+        with self.assertRaisesRegex(RuntimeError, 'TIP_FORCE_G is required'):
+            self.settings.cmd_set(Gcmd())
+        self.assertEqual(self.settings.get('tip'), (250., 0.15, 300.))
+
+    def test_cross_mcu_pressure_is_rejected_before_motion(self):
+        class Printer:
+            command_error = RuntimeError
+
+        class Endstop:
+            def get_dispatch(self):
+                return self
+
+            def get_mcu(self):
+                return 'pin-mcu'
+
+        class PressureEndstop:
+            def home_start_shared(self, print_time, dispatch):
+                pass
+
+            def get_mcu(self):
+                return 'load-cell-mcu'
+
+        with self.assertRaisesRegex(RuntimeError, 'shared MCU'):
+            validate_mcu_pressure_support(
+                Printer(), Endstop(), PressureEndstop(), 'TIP')
 
 
 class PressureGuardTests(unittest.TestCase):
@@ -87,6 +161,9 @@ class PressureGuardTests(unittest.TestCase):
 class FakeReactor:
     NEVER = float('inf')
 
+    def __init__(self):
+        self.callbacks = []
+
     def completion(self):
         return FakeCompletion()
 
@@ -97,6 +174,7 @@ class FakeReactor:
         pass
 
     def register_callback(self, callback):
+        self.callbacks.append(callback)
         self.callback = callback
 
     def monotonic(self):
@@ -125,11 +203,16 @@ class FakePrinter:
 
 
 class FakeEndstop:
-    def __init__(self, trigger_time):
+    def __init__(self, trigger_time, shared_reason=1):
         self.trigger_time = trigger_time
+        self.shared_reason = shared_reason
 
     def home_wait(self, home_end_time):
         return self.trigger_time
+
+    def home_wait_with_reason(self, home_end_time):
+        return (self.trigger_time if self.shared_reason == 1 else 0.,
+                self.shared_reason)
 
     def home_start(self, *args):
         completion = FakeCompletion()
@@ -138,6 +221,19 @@ class FakeEndstop:
 
     def trigger_time_to_print_time(self, trigger_time):
         return trigger_time
+
+    def get_dispatch(self):
+        return self
+
+
+class FakeMcuPressureEndstop(FakeEndstop):
+    SHARED_REASON_FORCE = 5
+
+    def home_start_shared(self, print_time, dispatch):
+        self.shared_dispatch = dispatch
+
+    def home_wait_shared(self, reason, home_end_time):
+        return self.trigger_time if reason == self.SHARED_REASON_FORCE else 0.
 
 
 class GuardedEndstopTests(unittest.TestCase):
@@ -186,6 +282,44 @@ class GuardedEndstopTests(unittest.TestCase):
         guarded = GuardedEndstop(FakePrinter(), FakeEndstop(0.0), guard)
         with self.assertRaisesRegex(RuntimeError, 'pressure protection'):
             guarded.home_wait(2.0)
+
+    def test_mcu_force_stops_move_and_reports_error_before_pin(self):
+        printer = FakePrinter()
+        guard = MovingPressureGuard(FakeLoadCell(), 250., 0.15, 0.)
+        guarded = GuardedEndstop(
+            printer, FakeEndstop(0.6, shared_reason=5), guard,
+            FakeMcuPressureEndstop(0.5), 300.)
+        completion = guarded.home_start(0., 0., 0, 0.)
+        self.assertIs(guarded._mcu_endstop.shared_dispatch,
+                      guarded._endstop.get_dispatch())
+        self.assertEqual(len(printer.reactor.callbacks), 1)
+        printer.reactor.callbacks[0](0.)
+        self.assertEqual(completion.value, 1)
+        with self.assertRaisesRegex(RuntimeError, 'MCU ADS1220 pressure protection'):
+            guarded.home_wait(1.)
+        self.assertEqual(guarded.pressure_trip_time, 0.5)
+
+    def test_pin_trigger_wins_shared_stop(self):
+        guard = MovingPressureGuard(FakeLoadCell(), 250., 0.15, 0.)
+        guarded = GuardedEndstop(
+            FakePrinter(), FakeEndstop(0.5), guard,
+            FakeMcuPressureEndstop(0.5), 300.)
+        self.assertEqual(guarded.home_wait(1.), 0.5)
+        self.assertIsNone(guarded.pressure_reason)
+
+    def test_pin_error_still_clears_analog_without_mislabeling_it(self):
+        class FailedPin(FakeEndstop):
+            def home_wait_with_reason(self, home_end_time):
+                raise RuntimeError('pin communication failed')
+
+        pressure = FakeMcuPressureEndstop(0.)
+        guarded = GuardedEndstop(
+            FakePrinter(), FailedPin(0.),
+            MovingPressureGuard(FakeLoadCell(), 250., 0.15, 0.),
+            pressure, 300.)
+        with self.assertRaisesRegex(RuntimeError, 'pin communication failed'):
+            guarded.home_wait(1.)
+        self.assertIsNone(guarded.pressure_reason)
 
 
 class PressureTraceTests(unittest.TestCase):
@@ -253,6 +387,26 @@ class PressureTraceTests(unittest.TestCase):
             self.assertEqual(rows[0]['force_limit_g'], '5.0')
             self.assertEqual(rows[0]['end_z_mm'], '19.0000')
             self.assertEqual(rows[0]['target_z_mm'], '15.0')
+
+            class McuStop:
+                pressure_reason = 'MCU ADS1220 pressure protection: 300 g limit'
+                pressure_trip_time = 1.1
+                _mcu_force_g = 300.
+
+            second_guard = Guard()
+            second_guard.reason = None
+            second_guard.trip_time = None
+            report_guard_failure(trace, directory, gcmd, Toolhead(),
+                                 20., 1., second_guard, Action(), 'tip',
+                                 {'max_dist': 5., 'retract_dist': 0.,
+                                  'retract_speed': 10.}, 0.,
+                                 RuntimeError('mcu hit'), McuStop())
+            second_path = gcmd.messages[-1].split('CSV=')[1]
+            with open(second_path, newline='', encoding='utf-8') as source:
+                mcu_row = next(csv.DictReader(source))
+            self.assertEqual(mcu_row['stop_reason'], 'mcu_force_limit')
+            self.assertEqual(mcu_row['mcu_force_limit_g'], '300.0')
+            self.assertEqual(mcu_row['trip_print_time_s'], '1.1')
 
     def test_stationary_and_no_moving_samples_are_explicit(self):
         trace = PressureTrace(FakeLoadCell())
