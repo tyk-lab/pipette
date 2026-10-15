@@ -79,9 +79,15 @@ chmod +x flash_rp2040_bootsel.sh
 ./deploy_to_klipper.sh
 ```
 
-The script links this directory's modules, including `load_cell_probe.py`, into
-`~/klipper/klippy/extras/` and restarts Klipper. If a target is a regular file,
-the script saves it with a timestamped `.bak` suffix before creating the link.
+The script links this directory's plugin modules, including
+`load_cell_probe.py`, into `~/klipper/klippy/extras/` and restarts Klipper.
+Existing regular plugin files get timestamped `.bak` copies. It does not
+check the Klipper Git version or modify `klippy/mcu.py` and
+`klippy/extras/trigger_analog.py`.
+
+TIP and liquid pressure protection runs in the pipette plugin and needs no
+Klipper core changes. Remove any old `pressure_guard_*_mcu_force_g` options
+from the active `pipette.cfg` before restarting Klipper.
 
 ### 3. Configure printer.cfg
 
@@ -191,15 +197,11 @@ limit.
 
 ### Enable protection after measuring
 
-In `[pipette_action]`, configure `pressure_guard_tip_force_g` and
-`pressure_guard_tip_clear_time` for TIP pickup, or
-`pressure_guard_liquid_force_g` and `pressure_guard_liquid_clear_time` for
-liquid probing. Each limit is the allowed **absolute force change from the
-moving baseline**, in grams. A missing force limit disables protection for
-that source only. Each clear time must be verified contact-free from the start
-of its descent. Normal TIP insertion can add about 200 g before `tip_pin`
-triggers in the recorded tests, while liquid contact showed no sustained 5 g
-change. Those observations do not establish safe stop limits. The optional
+In `[pipette_action]`, configure the force limits
+`pressure_guard_tip_force_g` / `pressure_guard_liquid_force_g` and their
+corresponding `*_clear_time` values. The guard measures **absolute force change
+from its moving baseline** on the Klipper host. A missing limit disables that
+source's guard. Each host clear time must be verified contact-free. The optional
 `pressure_guard_drift_g_s` defaults to 0; increase it only if moving traces
 show repeatable slow baseline drift. See the commented settings in
 [`pipette.cfg`](pipette.cfg).
@@ -207,17 +209,19 @@ show repeatable slow baseline drift. See the commented settings in
 When enabled, the guard learns the motion baseline during the clear interval.
 A sustained excess force, invalid readings, or lost ADS1220 samples stops Z and
 reports an error. A protection stop does not run `EXTRA_TRAVEL` or retract
-automatically. ADS1220 readings arrive in batches, so this stop can lag an MCU
-pin trigger. The guard ends when the selected TIP or liquid signal triggers;
+automatically. ADS1220 readings arrive in batches, so this stop can lag a
+physical pin trigger. The guard ends when the selected TIP or liquid signal triggers;
 TIP's subsequent 3 mm seating move is outside the guard. Measure actual
-stopping distance before relying on either threshold.
+stopping distance before relying on a threshold.
 
-The machine example in `../config/pipette.cfg` enables provisional test limits:
-250 g for TIP and 5 g for liquid, each with a 0.15 s contact-free baseline.
-Offline replay of the available normal traces did not trip these limits. This
-does not establish a safe collision force or stopping distance. At the configured
-5 mm/s probe speed, the 0.15 s baseline interval covers about 0.75 mm of descent
-without force detection. Keep the first collision test slow and its travel short.
+The machine example in `../config/pipette.cfg` enables provisional limits of
+250 g TIP and 5 g liquid. These values still need real stopping-distance
+verification. The 0.15 s baseline interval covers about 0.75 mm at 5 mm/s.
+
+Use `PIPETTE_PRESSURE_GUARD_SET` to change the TIP/liquid limits, clear times,
+or drift for subsequent probes without editing cfg. It prints current values
+with no parameters and resets to cfg after Klipper restarts. See
+[GCODE_COMMANDS.md](GCODE_COMMANDS.md) for syntax.
 
 After positioning Z near the test object and checking `min_safe_z`, the protected
 commands can be exercised with bounded travel, for example:

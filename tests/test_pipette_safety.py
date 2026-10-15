@@ -256,14 +256,33 @@ class ActionPreflightTests(unittest.TestCase):
 
 
 class PressureSourceTests(unittest.TestCase):
+    def test_runtime_pressure_command_is_registered(self):
+        module = load_action_module()
+        action = object.__new__(module.PipetteAction)
+        action.gcode = Mock()
+        action.printer = Mock()
+        action.reactor = Mock()
+        action.pressure_guard_settings = Mock()
+        action._register_commands()
+        registrations = action.gcode.register_command.call_args_list
+        commands = {call.args[0]: call.args[1] for call in registrations}
+        self.assertIs(commands['PIPETTE_PRESSURE_GUARD_SET'],
+                      action.pressure_guard_settings.cmd_set)
+
     def test_each_descent_uses_only_its_own_force_limit(self):
         module = load_action_module()
         action = object.__new__(module.PipetteAction)
         action.command_error = RuntimeError
         action.min_safe_z = 0.
-        action.pressure_guard_settings = {
-            'tip': (250., 0.2), 'liquid': (5., 0.3)}
-        action.pressure_guard_drift_g_s = 0.
+        class Settings:
+            drift_g_s = 0.
+            values = {'tip': (250., 0.2),
+                      'liquid': (5., 0.3)}
+
+            def get(self, source):
+                return self.values[source]
+
+        action.pressure_guard_settings = Settings()
         action.reactor = Mock()
         action._get_pressure_load_cell = Mock(return_value=object())
 
@@ -289,7 +308,7 @@ class PressureSourceTests(unittest.TestCase):
         gcmd = Mock()
         params = {'max_dist': 20., 'probe_speed': 5.,
                   'retract_dist': 0., 'retract_speed': 5.}
-        endstop = object()
+        endstop = Mock()
 
         with (patch.object(module.pipette_pressure_guard, 'MovingPressureGuard') as guard,
               patch.object(module.pipette_pressure_guard, 'GuardedEndstop') as wrapped,
@@ -310,7 +329,7 @@ class PressureSourceTests(unittest.TestCase):
                         self.assertEqual(toolhead.moves[0][0][2], 87.)
             self.assertEqual(guard.call_count, 2)
 
-            action.pressure_guard_settings['liquid'] = (None, None)
+            action.pressure_guard_settings.values['liquid'] = (None, None)
             action._z_probe_via_homing(
                 gcmd, Toolhead(), params, endstop, 'liquid',
                 pressure_source='liquid')

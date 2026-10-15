@@ -17,6 +17,7 @@ The active device is selected by `device_type` in `[pipette]` — no command cha
 | `PIPETTE_READ_TIP_PIN` | pipette_action | Read physical `tip_pin` state (pin mode only) |
 | `PIPETTE_READ_LIQUID_PIN` | pipette_action | Read physical `liquid_pin` state (pin mode only) |
 | `PIPETTE_PRESSURE_TEST` | pipette_action | Record ADS1220 force at rest or during a bounded Z descent |
+| `PIPETTE_PRESSURE_GUARD_SET` | pipette_action | Change pressure limits for subsequent TIP/liquid probes |
 
 ---
 
@@ -158,25 +159,39 @@ sensing. For SP20, `probe_timeout` must be at most 20 s and exceed
 
 ### Optional ADS1220 pressure protection
 
-TIP pickup uses `pressure_guard_tip_force_g` and
-`pressure_guard_tip_clear_time`; liquid probing uses
-`pressure_guard_liquid_force_g` and `pressure_guard_liquid_clear_time`.
-Each source is disabled when its force limit is absent. The limit is the
-absolute change from a moving baseline, in grams, not the total ADC reading.
-The optional `pressure_guard_drift_g_s` (default 0) applies to both sources.
+Each source has a force limit (`pressure_guard_tip_force_g` or
+`pressure_guard_liquid_force_g`) checked by the Klipper host. The limit is the
+absolute change from a moving baseline. The selected TIP or liquid signal is
+normal success; excess force stops with an error. A missing limit disables
+that source's protection. The optional `pressure_guard_drift_g_s` defaults to 0.
 
-Each clear time is a guaranteed contact-free period from the start of that
-descent. Force is not checked while this baseline is learned. A move
-too short to establish it is rejected before moving. A slow baseline drift may
+Each `pressure_guard_*_clear_time` is a guaranteed contact-free period from
+the start of that descent. A move too short to establish it is rejected before
+moving. A slow baseline drift may
 be compensated up to `pressure_guard_drift_g_s` only while readings remain far
 below the threshold. A sustained extra force stops Z and raises a protection
 error; it does not run `EXTRA_TRAVEL` or report normal pipette success. The
 selected TIP or liquid detection ends the guard; TIP seating after detection
-is outside it. Pipette detection takes priority if both arrive together.
-ADS1220 measurements are
-batched, so protection has more stopping delay than an MCU pin. Determine the
-clear period, drift limit, force limit, and stopping distance from traces before
-enabling the guard.
+is outside it. The selected sensor and host force guard can each stop Z.
+Determine limits and stopping distance from traces before relying on the guard.
+
+### PIPETTE_PRESSURE_GUARD_SET
+
+This built-in G-code changes the limits for the **next and later** probes in
+the current Klipper session. A restart restores the cfg values. No arguments
+prints the active values. Settings for both sources update together only after
+all supplied values pass validation.
+
+```gcode
+PIPETTE_PRESSURE_GUARD_SET
+PIPETTE_PRESSURE_GUARD_SET TIP_FORCE_G=250
+PIPETTE_PRESSURE_GUARD_SET LIQUID_FORCE_G=5
+PIPETTE_PRESSURE_GUARD_SET TIP_CLEAR_TIME=0.15 LIQUID_CLEAR_TIME=0.15 DRIFT_G_S=0
+```
+
+`*_FORCE_G=0` disables that source's force guard. `*_CLEAR_TIME` must be
+0.15–5 s; force values above zero may be at most 5000 g. The former
+`*_MCU_FORCE_G` parameters are no longer supported.
 
 The protected `PIPETTE_PICKUP_TIP` and `PIPETTE_LIQUID_PROBE` commands save a
 force CSV in `pipette_pressure_reports/` beside `klippy.log` when the protected

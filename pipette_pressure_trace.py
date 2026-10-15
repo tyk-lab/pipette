@@ -159,6 +159,7 @@ def report_guard_failure(trace, directory, gcmd, toolhead, start_z, speed,
         end_z = toolhead.get_position()[2]
         motion_end = toolhead.get_last_move_time()
         detail = guard.reason or str(move_error)
+        stop_reason = _guard_stop_reason(guard.reason)
         metadata = {
             'record_kind': 'guard',
             'command': gcmd.get_commandline(),
@@ -166,7 +167,7 @@ def report_guard_failure(trace, directory, gcmd, toolhead, start_z, speed,
             'trigger_source': _trigger_source(action, source),
             'trigger_pin': getattr(action, '_%s_pin_name' % source, '') or '',
             'device_type': getattr(getattr(action, '_drv', None), 'device_type', ''),
-            'stop_reason': _guard_stop_reason(guard.reason),
+            'stop_reason': stop_reason,
             'stop_detail': detail,
             'max_dist_mm': params['max_dist'],
             'target_z_mm': start_z - params['max_dist'],

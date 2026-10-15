@@ -376,7 +376,6 @@ class LoadCellProbingMove:
 class TappingMove:
     def __init__(self, config, load_cell_probing_move, config_helper):
         self._printer = config.get_printer()
-        self._load_cell_probing_move = load_cell_probing_move
         self._config_helper = config_helper
         # track results of the last tap
         self._last_result = None
@@ -506,6 +505,7 @@ class LoadCellPrinterProbe:
         load_cell_probing_move = LoadCellProbingMove(config, self._load_cell,
             self._mcu_trigger_analog, self._param_helper,
             continuous_tare_filter_helper, config_helper)
+        self._load_cell_probing_move = load_cell_probing_move
         self._tapping_move = TappingMove(config, load_cell_probing_move,
             config_helper)
         tap_session = TapSession(config, self._tapping_move,

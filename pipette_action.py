@@ -249,18 +249,8 @@ class PipetteAction:
         self.max_comm_failures   = config.getint("max_comm_failures",     3,    minval=1,   maxval=10)
         self.endstop_poll_interval = config.getfloat(
             "endstop_poll_interval", _ENDSTOP_POLL_S, minval=0.02, maxval=5.0)
-        self.pressure_guard_settings = {}
-        for source in ("tip", "liquid"):
-            force_name = "pressure_guard_%s_force_g" % source
-            clear_name = "pressure_guard_%s_clear_time" % source
-            force_g = config.getfloat(force_name, None, minval=0.05)
-            clear_time = config.getfloat(clear_name, None, minval=0.15, maxval=5.0)
-            if force_g is not None and clear_time is None:
-                raise config.error("%s is required when %s is set"
-                                   % (clear_name, force_name))
-            self.pressure_guard_settings[source] = (force_g, clear_time)
-        self.pressure_guard_drift_g_s = config.getfloat(
-            "pressure_guard_drift_g_s", 0.0, minval=0.0)
+        self.pressure_guard_settings = (
+            pipette_pressure_guard.PressureGuardSettings(config))
 
         # ---- Optional physical pins ----
         self._tip_pin_name       = config.get("tip_pin",    None)
@@ -382,6 +372,8 @@ class PipetteAction:
         self._pressure_test = pipette_pressure_trace.PipettePressureTest(self)
         reg("PIPETTE_PRESSURE_TEST", self._pressure_test.cmd,
             desc=self.cmd_pipette_pressure_test_help)
+        reg("PIPETTE_PRESSURE_GUARD_SET", self.pressure_guard_settings.cmd_set,
+            desc="Set TIP/LIQUID pressure limits for subsequent probes")
 
     # ================================================================
     #  Internal helpers
@@ -618,8 +610,8 @@ class PipetteAction:
         pos[2] = target_z
         phoming = self.printer.lookup_object("homing")
         trace = None
-        force_g, clear_time = self.pressure_guard_settings.get(
-            pressure_source, (None, None))
+        force_g, clear_time = (
+            self.pressure_guard_settings.get(pressure_source))
         if force_g is not None:
             if max_dist / probe_speed <= clear_time + 0.1:
                 raise self.command_error(
@@ -631,7 +623,8 @@ class PipetteAction:
             trace = pipette_pressure_trace.PressureTrace(load_cell)
             guard = pipette_pressure_guard.MovingPressureGuard(
                 load_cell, force_g, clear_time,
-                self.pressure_guard_drift_g_s, self.reactor.monotonic)
+                self.pressure_guard_settings.drift_g_s,
+                self.reactor.monotonic)
             endstop = pipette_pressure_guard.GuardedEndstop(
                 self.printer, endstop, guard)
             trace.start()

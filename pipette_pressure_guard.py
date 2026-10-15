@@ -6,6 +6,58 @@ from statistics import median
 import time
 
 
+class PressureGuardSettings:
+    """Validated per-source limits, with session-only G-code overrides."""
+
+    def __init__(self, config):
+        self._settings = {}
+        for source in ('tip', 'liquid'):
+            prefix = 'pressure_guard_%s_' % source
+            if config.get(prefix + 'mcu_force_g', None) is not None:
+                raise config.error(
+                    '%smcu_force_g was removed; use %sforce_g'
+                    % (prefix, prefix))
+            force = config.getfloat(prefix + 'force_g', None,
+                                    minval=0.05, maxval=5000.)
+            clear = config.getfloat(prefix + 'clear_time', None,
+                                    minval=0.15, maxval=5.)
+            if force is not None and clear is None:
+                raise config.error('%sclear_time is required with %sforce_g'
+                                   % (prefix, prefix))
+            self._settings[source] = (force, clear)
+        self.drift_g_s = config.getfloat('pressure_guard_drift_g_s', 0.,
+                                         minval=0.)
+
+    def get(self, source):
+        return self._settings[source]
+
+    def cmd_set(self, gcmd):
+        """Update the next probing move; a failed update leaves all values intact."""
+        updated = {}
+        for source in ('tip', 'liquid'):
+            force, clear = self._settings[source]
+            prefix = source.upper() + '_'
+            if gcmd.get(prefix + 'MCU_FORCE_G', None) is not None:
+                raise gcmd.error(
+                    '%sMCU_FORCE_G was removed; use %sFORCE_G'
+                    % (prefix, prefix))
+            force = gcmd.get_float(prefix + 'FORCE_G', force or 0.,
+                                   minval=0., maxval=5000.) or None
+            clear = gcmd.get_float(prefix + 'CLEAR_TIME', clear,
+                                   minval=0.15, maxval=5.)
+            if force is not None and clear is None:
+                raise gcmd.error('%sCLEAR_TIME is required' % prefix)
+            updated[source] = (force, clear)
+        drift = gcmd.get_float('DRIFT_G_S', self.drift_g_s, minval=0.)
+        self._settings = updated
+        self.drift_g_s = drift
+        gcmd.respond_info(
+            'PIPETTE_PRESSURE_GUARD_SET: TIP force=%s clear=%s; '
+            'LIQUID force=%s clear=%s; drift=%.3f g/s; '
+            'effective from the next probe until Klipper restarts'
+            % (*updated['tip'], *updated['liquid'], drift))
+
+
 class MovingPressureGuard:
     """Learn motion preload in a known clear interval, then watch extra force."""
 
@@ -174,14 +226,14 @@ class GuardedEndstop:
                 self._reactor.unregister_timer(self._watchdog_timer)
                 self._watchdog_timer = None
             self._guard.stop()
-        # Compare measurement times, not message arrival order. The physical
+        # Compare measurement times, not callback arrival order. The physical
         # pin wins a tie; a later pin must not mask an earlier pressure trip.
         pin_time = (self._endstop.trigger_time_to_print_time(trigger_time)
                     if trigger_time > 0. else None)
-        if (pin_time is not None and
-                (self._guard.reason is None or
-                 (self._guard.trip_time is not None
-                  and pin_time <= self._guard.trip_time))):
+        if (pin_time is not None
+                and (self._guard.reason is None or
+                     (self._guard.trip_time is not None
+                      and pin_time <= self._guard.trip_time))):
             return trigger_time
         if self._guard.reason is not None:
             raise self._printer.command_error(self._guard.reason)

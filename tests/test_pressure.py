@@ -3,7 +3,8 @@ import os
 import tempfile
 import unittest
 
-from pipette.pipette_pressure_guard import GuardedEndstop, MovingPressureGuard
+from pipette.pipette_pressure_guard import (
+    GuardedEndstop, MovingPressureGuard, PressureGuardSettings)
 from pipette.pipette_pressure_trace import (
     PipettePressureTest, PressureTrace, report_guard_failure)
 
@@ -23,6 +24,89 @@ def samples(start, stop, force, step=0.005):
     count = round((stop - start) / step)
     return [(round(start + i * step, 6), force, 100, 0)
             for i in range(count)]
+
+
+class PressureGuardSettingsTests(unittest.TestCase):
+    def setUp(self):
+        class Config:
+            error = RuntimeError
+
+            def getfloat(self, name, default, **kwargs):
+                values = {
+                    'pressure_guard_tip_force_g': 250.,
+                    'pressure_guard_tip_clear_time': 0.15,
+                    'pressure_guard_liquid_force_g': 5.,
+                    'pressure_guard_liquid_clear_time': 0.15,
+                }
+                return values.get(name, default)
+
+            def get(self, name, default=None):
+                return default
+
+        self.settings = PressureGuardSettings(Config())
+
+    def test_updates_next_probe_settings_without_changing_other_source(self):
+        class Gcmd:
+            error = RuntimeError
+
+            def __init__(self):
+                self.messages = []
+
+            def get_float(self, name, default, **kwargs):
+                return {'TIP_FORCE_G': 240.}.get(name, default)
+
+            def get(self, name, default=None):
+                return default
+
+            def respond_info(self, message):
+                self.messages.append(message)
+
+        gcmd = Gcmd()
+        self.settings.cmd_set(gcmd)
+        self.assertEqual(self.settings.get('tip'), (240., 0.15))
+        self.assertEqual(self.settings.get('liquid'), (5., 0.15))
+        self.assertIn('effective from the next probe', gcmd.messages[0])
+
+    def test_removed_mcu_parameter_does_not_change_any_setting(self):
+        class Gcmd:
+            error = RuntimeError
+
+            def get_float(self, name, default, **kwargs):
+                return 240. if name == 'TIP_FORCE_G' else default
+
+            def get(self, name, default=None):
+                return 300. if name == 'TIP_MCU_FORCE_G' else default
+
+        with self.assertRaisesRegex(RuntimeError, 'TIP_MCU_FORCE_G was removed'):
+            self.settings.cmd_set(Gcmd())
+        self.assertEqual(self.settings.get('tip'), (250., 0.15))
+
+    def test_host_limit_can_be_disabled_for_next_probe(self):
+        class Gcmd:
+            error = RuntimeError
+
+            def get(self, name, default=None):
+                return default
+
+            def get_float(self, name, default, **kwargs):
+                return 0. if name == 'TIP_FORCE_G' else default
+
+            def respond_info(self, message):
+                pass
+
+        self.settings.cmd_set(Gcmd())
+        self.assertEqual(self.settings.get('tip'), (None, 0.15))
+        self.assertEqual(self.settings.get('liquid'), (5., 0.15))
+
+    def test_removed_mcu_config_option_has_actionable_error(self):
+        class Config:
+            error = RuntimeError
+
+            def get(self, name, default=None):
+                return 300. if name == 'pressure_guard_tip_mcu_force_g' else default
+
+        with self.assertRaisesRegex(RuntimeError, 'pressure_guard_tip_mcu_force_g was removed'):
+            PressureGuardSettings(Config())
 
 
 class PressureGuardTests(unittest.TestCase):
@@ -87,6 +171,9 @@ class PressureGuardTests(unittest.TestCase):
 class FakeReactor:
     NEVER = float('inf')
 
+    def __init__(self):
+        self.callbacks = []
+
     def completion(self):
         return FakeCompletion()
 
@@ -97,6 +184,7 @@ class FakeReactor:
         pass
 
     def register_callback(self, callback):
+        self.callbacks.append(callback)
         self.callback = callback
 
     def monotonic(self):
@@ -138,7 +226,6 @@ class FakeEndstop:
 
     def trigger_time_to_print_time(self, trigger_time):
         return trigger_time
-
 
 class GuardedEndstopTests(unittest.TestCase):
     def test_force_trip_completes_homing_wait(self):
@@ -186,7 +273,6 @@ class GuardedEndstopTests(unittest.TestCase):
         guarded = GuardedEndstop(FakePrinter(), FakeEndstop(0.0), guard)
         with self.assertRaisesRegex(RuntimeError, 'pressure protection'):
             guarded.home_wait(2.0)
-
 
 class PressureTraceTests(unittest.TestCase):
     def test_pressure_stop_saves_force_curve_and_stop_reason(self):
