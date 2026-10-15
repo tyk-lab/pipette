@@ -2,6 +2,7 @@
 
 import csv
 import datetime
+import logging
 import os
 from statistics import median
 
@@ -88,6 +89,26 @@ class PressureTrace:
                 "extra_range=%.3f..%.3f g" %
                 (baseline, len(moving), min(moving), max(moving),
                  min(extra), max(extra)))
+
+
+def report_guard_failure(trace, directory, gcmd, toolhead, start_z, speed,
+                         guard):
+    """Save the descent samples after a pressure stop without masking its error."""
+    try:
+        end_z = toolhead.get_position()[2]
+        motion_end = toolhead.get_last_move_time()
+        path = trace.write_csv(directory, start_z, end_z,
+                               guard._start_time, motion_end, speed)
+        gcmd.respond_info(
+            'PIPETTE_PRESSURE_GUARD: stop_reason=%s; start_z=%.3f '
+            'end_z=%.3f; %s; samples=%d errors=%d overflows=%d '
+            'truncated=%s CSV=%s' %
+            (guard.reason, start_z, end_z,
+             trace.summary(guard._start_time, motion_end),
+             len(trace.samples), trace.errors, trace.overflows,
+             trace.truncated, path))
+    except Exception:
+        logging.exception('Pipette pressure guard: failed to save stop trace')
 
 
 class PipettePressureTest:

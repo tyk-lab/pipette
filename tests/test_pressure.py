@@ -3,7 +3,8 @@ import tempfile
 import unittest
 
 from pipette.pipette_pressure_guard import GuardedEndstop, MovingPressureGuard
-from pipette.pipette_pressure_trace import PipettePressureTest, PressureTrace
+from pipette.pipette_pressure_trace import (
+    PipettePressureTest, PressureTrace, report_guard_failure)
 
 
 class FakeLoadCell:
@@ -187,6 +188,43 @@ class GuardedEndstopTests(unittest.TestCase):
 
 
 class PressureTraceTests(unittest.TestCase):
+    def test_pressure_stop_saves_force_curve_and_stop_reason(self):
+        cell = FakeLoadCell()
+        trace = PressureTrace(cell)
+        trace.samples = [(0.9, 0.0, 100, 0), (1.1, 2.0, 120, 0),
+                         (1.2, 8.0, 180, 0)]
+
+        class Toolhead:
+            def get_position(self):
+                return [0., 0., 19., 0.]
+
+            def get_last_move_time(self):
+                return 1.2
+
+        class Guard:
+            reason = 'ADS1220 pressure protection: extra force 8 g >= 5 g'
+            _start_time = 1.0
+
+        class Gcmd:
+            def __init__(self):
+                self.messages = []
+
+            def respond_info(self, message):
+                self.messages.append(message)
+
+        with tempfile.TemporaryDirectory() as directory:
+            gcmd = Gcmd()
+            report_guard_failure(trace, directory, gcmd, Toolhead(),
+                                 20., 5., Guard())
+            self.assertIn('stop_reason=ADS1220 pressure protection',
+                          gcmd.messages[0])
+            path = gcmd.messages[0].split('CSV=')[1]
+            with open(path, newline='', encoding='utf-8') as source:
+                rows = list(csv.DictReader(source))
+            self.assertEqual([row['phase'] for row in rows],
+                             ['before', 'descent', 'descent'])
+            self.assertEqual(rows[-1]['force_g'], '8.00000')
+
     def test_stationary_and_no_moving_samples_are_explicit(self):
         trace = PressureTrace(FakeLoadCell())
         trace.samples = [(0.1, 1.2, 120, 0), (0.2, 1.4, 140, 0)]

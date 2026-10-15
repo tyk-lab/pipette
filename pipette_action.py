@@ -249,16 +249,18 @@ class PipetteAction:
         self.max_comm_failures   = config.getint("max_comm_failures",     3,    minval=1,   maxval=10)
         self.endstop_poll_interval = config.getfloat(
             "endstop_poll_interval", _ENDSTOP_POLL_S, minval=0.02, maxval=5.0)
-        self.pressure_guard_force_g = config.getfloat(
-            "pressure_guard_force_g", None, minval=0.05)
-        self.pressure_guard_clear_time = config.getfloat(
-            "pressure_guard_clear_time", None, minval=0.15, maxval=5.0)
+        self.pressure_guard_settings = {}
+        for source in ("tip", "liquid"):
+            force_name = "pressure_guard_%s_force_g" % source
+            clear_name = "pressure_guard_%s_clear_time" % source
+            force_g = config.getfloat(force_name, None, minval=0.05)
+            clear_time = config.getfloat(clear_name, None, minval=0.15, maxval=5.0)
+            if force_g is not None and clear_time is None:
+                raise config.error("%s is required when %s is set"
+                                   % (clear_name, force_name))
+            self.pressure_guard_settings[source] = (force_g, clear_time)
         self.pressure_guard_drift_g_s = config.getfloat(
             "pressure_guard_drift_g_s", 0.0, minval=0.0)
-        if (self.pressure_guard_force_g is not None
-                and self.pressure_guard_clear_time is None):
-            raise config.error(
-                "pressure_guard_clear_time is required when pressure guard is enabled")
 
         # ---- Optional physical pins ----
         self._tip_pin_name       = config.get("tip_pin",    None)
@@ -589,7 +591,8 @@ class PipetteAction:
                 % (label, target_z, max_z))
 
     def _z_probe_via_homing(self, gcmd, toolhead, params, endstop, label,
-                            extra_travel=0.0, confirm_fn=None):
+                            extra_travel=0.0, confirm_fn=None,
+                            pressure_source=None):
         max_dist      = params["max_dist"]
         probe_speed   = params["probe_speed"]
         retract_dist  = params["retract_dist"]
@@ -614,19 +617,37 @@ class PipetteAction:
 
         pos[2] = target_z
         phoming = self.printer.lookup_object("homing")
-        if self.pressure_guard_force_g is not None:
-            clear_time = self.pressure_guard_clear_time
+        trace = None
+        force_g, clear_time = self.pressure_guard_settings.get(
+            pressure_source, (None, None))
+        if force_g is not None:
             if max_dist / probe_speed <= clear_time + 0.1:
                 raise self.command_error(
                     "%s: descent is too short to establish the pressure baseline"
                     % label)
             load_cell = self._get_pressure_load_cell()
+            directory = pipette_pressure_trace.PressureTrace.log_directory(
+                self.printer)
+            trace = pipette_pressure_trace.PressureTrace(load_cell)
             guard = pipette_pressure_guard.MovingPressureGuard(
-                load_cell, self.pressure_guard_force_g, clear_time,
+                load_cell, force_g, clear_time,
                 self.pressure_guard_drift_g_s, self.reactor.monotonic)
             endstop = pipette_pressure_guard.GuardedEndstop(
                 self.printer, endstop, guard)
-        epos = phoming.probing_move(endstop, pos, probe_speed)
+            trace.start()
+        try:
+            epos = phoming.probing_move(endstop, pos, probe_speed)
+        except Exception:
+            if trace is not None:
+                trace.stop()
+                if guard.reason is not None:
+                    pipette_pressure_trace.report_guard_failure(
+                        trace, directory, gcmd, toolhead, start_z,
+                        probe_speed, guard)
+            raise
+        else:
+            if trace is not None:
+                trace.stop()
         trigger_z = epos[2]
 
         if confirm_fn is not None:
@@ -693,7 +714,7 @@ class PipetteAction:
         trigger_z = self._z_probe_via_homing(
             gcmd, toolhead, params, self._tip_endstop,
             "PIPETTE_PICKUP_TIP", extra_travel=extra_travel,
-            confirm_fn=self._confirm_tip_trigger)
+            confirm_fn=self._confirm_tip_trigger, pressure_source="tip")
         gcmd.respond_info(
             "PIPETTE_PICKUP_TIP: success  trigger Z=%.3f mm" % trigger_z)
 
@@ -735,7 +756,8 @@ class PipetteAction:
             trigger_z = self._z_probe_via_homing(
                 gcmd, toolhead, params, self._liquid_endstop,
                 "PIPETTE_LIQUID_PROBE", extra_travel=extra_travel,
-                confirm_fn=self._confirm_liquid_trigger)
+                confirm_fn=self._confirm_liquid_trigger,
+                pressure_source="liquid")
         except Exception:
             try:
                 self._liquid_probe_stop()

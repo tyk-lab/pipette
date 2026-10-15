@@ -151,22 +151,32 @@ sensing. For SP20, `probe_timeout` must be at most 20 s and exceed
 
 ### Optional ADS1220 pressure protection
 
-Both descent commands can use `[pipette_action]` settings
-`pressure_guard_force_g`, `pressure_guard_clear_time`, and optionally
-`pressure_guard_drift_g_s` (default 0). The guard is disabled when
-`pressure_guard_force_g` is absent. The force limit is the **extra** absolute
-force above a motion baseline, in grams, not the total ADC reading.
+TIP pickup uses `pressure_guard_tip_force_g` and
+`pressure_guard_tip_clear_time`; liquid probing uses
+`pressure_guard_liquid_force_g` and `pressure_guard_liquid_clear_time`.
+Each source is disabled when its force limit is absent. The limit is the
+absolute change from a moving baseline, in grams, not the total ADC reading.
+The optional `pressure_guard_drift_g_s` (default 0) applies to both sources.
 
-`pressure_guard_clear_time` is a guaranteed contact-free period from the start
-of descent. The guard takes its baseline near the end of that period. A move
+Each clear time is a guaranteed contact-free period from the start of that
+descent. Force is not checked while this baseline is learned. A move
 too short to establish it is rejected before moving. A slow baseline drift may
 be compensated up to `pressure_guard_drift_g_s` only while readings remain far
 below the threshold. A sustained extra force stops Z and raises a protection
-error; it does not run `EXTRA_TRAVEL` or report normal pipette success. A pipette
-pipette detection takes priority if both arrive together. ADS1220 measurements are
+error; it does not run `EXTRA_TRAVEL` or report normal pipette success. The
+selected TIP or liquid detection ends the guard; TIP seating after detection
+is outside it. Pipette detection takes priority if both arrive together.
+ADS1220 measurements are
 batched, so protection has more stopping delay than an MCU pin. Determine the
 clear period, drift limit, force limit, and stopping distance from traces before
 enabling the guard.
+
+The protected `PIPETTE_PICKUP_TIP` and `PIPETTE_LIQUID_PROBE` commands save a
+force CSV beside `klippy.log` when the guard raises an error. The console prints
+`PIPETTE_PRESSURE_GUARD: stop_reason=...`, reported end Z, sample count, and CSV
+path. The CSV Z column is estimated. A normal sensor trigger does not create
+this error CSV. The separate `PIPETTE_PRESSURE_TEST` command does not stop on
+force.
 
 ### PIPETTE_PRESSURE_TEST
 

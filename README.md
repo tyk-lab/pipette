@@ -143,6 +143,97 @@ See [GCODE_COMMANDS.md](GCODE_COMMANDS.md) for the full command reference.
 
 ---
 
+## ADS1220 Pressure Test and Protection
+
+Pressure sensing requires a configured `[load_cell_probe]` using ADS1220, plus a
+calibrated and tared load cell. Both the test command and the optional protection
+check these conditions before use. The deployed `load_cell_probe.py` exposes the
+sensor to `pipette_action.py`.
+
+### Measure force before enabling protection
+
+`PIPETTE_PRESSURE_TEST` records ADS1220 force for choosing protection settings.
+It is a diagnostic command: **it does not enable the force limit or stop Z on
+force alone**. Use it first at rest, then during a bounded descent:
+
+```gcode
+PIPETTE_PRESSURE_TEST DIST=0 HOLD=1
+PIPETTE_PRESSURE_TEST DIST=20 SPEED=5 SOURCE=TIP
+PIPETTE_PRESSURE_TEST DIST=20 SPEED=5 SOURCE=LIQUID
+```
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `DIST` | `0` | `0` records without moving; `0`–`100` mm sets the maximum downward travel. |
+| `HOLD` | `1` s | Recording time, `0.2`–`10` s; used only when `DIST=0`. |
+| `SPEED` | `probe_speed` | Descent speed, `0.1`–`100` mm/s; used when `DIST>0`. |
+| `SOURCE` | `TIP` | `TIP` or `LIQUID`: sensor that stops a moving test. |
+
+For `DIST>0`, Z must be homed and `min_safe_z` must be set so the target stays
+above that limit. `DIST / SPEED` may not exceed 30 seconds. The selected sensor
+stops the descent if it triggers; otherwise Z may travel the full `DIST` and the
+result is `distance_reached`. A configured pin is used instead of device-status
+polling for that sensor. `SOURCE=LIQUID` starts and stops liquid sensing through
+USB. The command does not perform `EXTRA_TRAVEL` or retract automatically, so
+Z remains at the stopping position until another command moves it.
+
+The console reports `stationary`, `pipette_sensor`, `distance_reached`, or
+`error`, plus the baseline, sample counts, force range, and sampling errors.
+A CSV beside `klippy.log` contains sample time, phase, raw counts, force in
+grams, and an **estimated** Z position. This estimate is less accurate during acceleration
+and stopping. Sensor errors, overflows, or a truncated recording make the test
+report an error. If there are no moving samples, the trace cannot establish a
+motion baseline. Use moving traces to identify a guaranteed contact-free
+interval, normal motion preload, and drift; measure actual stopping distance
+separately. A stationary trace alone is insufficient for selecting the guard
+limit.
+
+### Enable protection after measuring
+
+In `[pipette_action]`, configure `pressure_guard_tip_force_g` and
+`pressure_guard_tip_clear_time` for TIP pickup, or
+`pressure_guard_liquid_force_g` and `pressure_guard_liquid_clear_time` for
+liquid probing. Each limit is the allowed **absolute force change from the
+moving baseline**, in grams. A missing force limit disables protection for
+that source only. Each clear time must be verified contact-free from the start
+of its descent. Normal TIP insertion can add about 200 g before `tip_pin`
+triggers in the recorded tests, while liquid contact showed no sustained 5 g
+change. Those observations do not establish safe stop limits. The optional
+`pressure_guard_drift_g_s` defaults to 0; increase it only if moving traces
+show repeatable slow baseline drift. See the commented settings in
+[`pipette.cfg`](pipette.cfg).
+
+When enabled, the guard learns the motion baseline during the clear interval.
+A sustained excess force, invalid readings, or lost ADS1220 samples stops Z and
+reports an error. A protection stop does not run `EXTRA_TRAVEL` or retract
+automatically. ADS1220 readings arrive in batches, so this stop can lag an MCU
+pin trigger. The guard ends when the selected TIP or liquid signal triggers;
+TIP's subsequent 3 mm seating move is outside the guard. Measure actual
+stopping distance before relying on either threshold.
+
+The machine example in `../config/pipette.cfg` enables provisional test limits:
+250 g for TIP and 5 g for liquid, each with a 0.15 s contact-free baseline.
+Offline replay of the available normal traces did not trip these limits. This
+does not establish a safe collision force or stopping distance. At the configured
+5 mm/s probe speed, the 0.15 s baseline interval covers about 0.75 mm of descent
+without force detection. Keep the first collision test slow and its travel short.
+
+After positioning Z near the test object and checking `min_safe_z`, the protected
+commands can be exercised with bounded travel, for example:
+
+```gcode
+PIPETTE_LIQUID_PROBE MAX_DIST=5 SPEED=1 EXTRA_TRAVEL=0 RETRACT=0
+PIPETTE_PICKUP_TIP MAX_DIST=5 SPEED=1 EXTRA_TRAVEL=0 RETRACT=0
+```
+
+Run one source at a time. On a pressure stop, Klipper reports
+`PIPETTE_PRESSURE_GUARD: stop_reason=...`, its reported end Z, and a CSV path
+beside `klippy.log`. The CSV contains the descent force samples and an estimated
+Z; it is saved on a pressure protection error, not on an ordinary sensor trigger.
+`PIPETTE_PRESSURE_TEST` remains diagnostic and does not stop on force.
+
+---
+
 ## Device Protocols
 
 | | ADP1000 | SP20 |
@@ -189,14 +280,14 @@ See [GCODE_COMMANDS.md](GCODE_COMMANDS.md) for the full command reference.
 | `min_safe_z` | *(required for automatic descent)* | Lowest Z allowed at both stations |
 | `tip_pin` | *(none)* | Hardware endstop pin for TIP detection |
 | `liquid_pin` | *(none)* | Hardware endstop pin for liquid detection |
-| `pressure_guard_force_g` | *(none)* | Extra-force limit in g; absent disables the guard |
-| `pressure_guard_clear_time` | *(none)* | Required contact-free baseline period when guard is enabled |
+| `pressure_guard_tip_force_g` | *(none)* | TIP abnormal-force limit before TIP detection; absent disables TIP guard |
+| `pressure_guard_tip_clear_time` | *(none)* | Required TIP contact-free baseline period |
+| `pressure_guard_liquid_force_g` | *(none)* | Liquid collision-force limit before liquid detection; absent disables liquid guard |
+| `pressure_guard_liquid_clear_time` | *(none)* | Required liquid contact-free baseline period |
 | `pressure_guard_drift_g_s` | 0 | Maximum slow motion-baseline drift compensation |
 
-When a trigger pin is configured, that pin alone decides whether to stop the
-corresponding Z descent. Without a pin, device-status polling is used instead.
-SP20 liquid sensing still needs USB commands to start and stop detection.
-
-Use `PIPETTE_PRESSURE_TEST` to measure motion preload before configuring the
-guard. Moving tests and automatic descents require a configured `min_safe_z`. See
-[GCODE_COMMANDS.md](GCODE_COMMANDS.md) for the command and safety details.
+For pipette detection, a configured trigger pin replaces device-status polling
+as the Z stop source. Without a pin, device-status polling is used instead.
+SP20 liquid sensing still needs USB commands to start and stop detection. An
+enabled ADS1220 pressure guard is a separate stop source for either mode. See
+[GCODE_COMMANDS.md](GCODE_COMMANDS.md) for the full command and safety details.
